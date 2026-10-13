@@ -1,0 +1,13 @@
+[Unit]
+Description=k1-lidar: LiDAR captures and analysis for the K1 Max (lidar.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/k1-lidar/lidar_service.py --printer PRINTER_IP:7130 --listen 0.0.0.0:7131 --allow PRINTER_IP --data /var/lib/k1-lidar
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
