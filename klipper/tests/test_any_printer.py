@@ -141,5 +141,67 @@ class TestTouch(unittest.TestCase):
         self.assertNotIn("gcode_macro _LOAD_CELL_TOUCH_Z", objs["_looked_up"])
 
 
+class FakeConfig:
+    def __init__(self, sections):
+        self.sections = sections
+
+    def has_section(self, name):
+        return name in self.sections
+
+    def getsection(self, name):
+        opts = self.sections[name]
+        return type("S", (), {"get": lambda _s, k, d=None: opts.get(k, d)})()
+
+
+class TestSetupCheck(unittest.TestCase):
+    def report(self, L):
+        return dict((item, (ok, text)) for item, ok, text in L.setup_report())
+
+    def test_report_small_bed_probe(self):
+        L, log, objs = make_lidar(probe_offsets=(0.0, 20.3), **SMALL)
+        L.service = None
+        L._call = lambda msg, timeout=10.0: {"result": {"exposure": 1000}}
+        r = self.report(L)
+        self.assertEqual([i for i, ok, t in L.setup_report()][:4],
+                         ["driver", "offsets", "timing", "service"])
+        self.assertTrue(r["driver"][0])
+        self.assertFalse(r["timing"][0])
+        self.assertFalse(r["service"][0])
+        self.assertIn("need it", r["service"][1])
+        self.assertTrue(r["area"][0])
+        self.assertIn("X0.5-193.5 Y0.5-203.3", r["area"][1])
+        self.assertTrue(r["touch"][0])
+        self.assertIn("less accurate", r["touch"][1])
+
+    def test_report_driver_down(self):
+        L, log, objs = make_lidar(load_cell=True, **SMALL)
+
+        def down(req, timeout=30.0):
+            raise Err("no answer")
+        L._svc = down
+        r = self.report(L)
+        self.assertFalse(r["driver"][0])
+        self.assertFalse(r["service"][0])
+
+    def test_report_empty_area(self):
+        L, log, objs = make_lidar(axis_min=(0.0, 0.0), axis_max=(30.0, 30.0),
+                                  offset=(-36.0, 0.0))
+        L._svc = lambda req, timeout=30.0: {"ok": True, "reply": {}}
+        r = self.report(L)
+        self.assertFalse(r["area"][0])
+        self.assertFalse(r["touch"][0])
+
+    def test_default_dirs(self):
+        import lidar
+        home = os.path.expanduser("~/printer_data")
+        cfg = FakeConfig({"virtual_sdcard": {"path": "~/printer_data/gcodes"}})
+        self.assertEqual(lidar._default_dirs(cfg),
+                         (os.path.join(home, "lidar"),
+                          os.path.join(home, "gcodes")))
+        self.assertEqual(lidar._default_dirs(FakeConfig({})),
+                         ("/usr/data/printer_data/lidar",
+                          "/usr/data/printer_data/gcodes"))
+
+
 if __name__ == "__main__":
     unittest.main()

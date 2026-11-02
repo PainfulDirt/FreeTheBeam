@@ -36,6 +36,8 @@
 #
 # Commands:
 #   LIDAR_STATUS
+#   LIDAR_SETUP_CHECK  what this printer's setup can do: driver, offsets,
+#       timing, service, laser area, touch method; lists what is missing
 #   LIDAR_SCAN NAME= X= Y0= Y1= [STEP=0.4] [Z=3] [MODE=dwell|stop]
 #       [CAPTURES=3] [LEVEL=scan_level]
 #       X/Y are where the laser looks (not the nozzle); one profile per Y.
@@ -1840,6 +1842,17 @@ def skew_solve(scans, printed_skew=0.0, length=100.0):
             "mode": "diamond" if diamond else "axis"}
 
 
+def _default_dirs(config):
+    """(data_dir, gcode_dir): next to Klipper's virtual_sdcard path
+    (printer_data/gcodes -> printer_data/lidar), else the K1 Max ones."""
+    if config.has_section("virtual_sdcard"):
+        path = config.getsection("virtual_sdcard").get("path", None)
+        if path:
+            gcodes = os.path.normpath(os.path.expanduser(path))
+            return os.path.join(os.path.dirname(gcodes), "lidar"), gcodes
+    return "/usr/data/printer_data/lidar", "/usr/data/printer_data/gcodes"
+
+
 class Lidar:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -1907,11 +1920,9 @@ class Lidar:
         self.printer.load_object(config, "motion_report")
         self.mode = config.getchoice("mode", {"dwell": "dwell",
                                               "stop": "stop"}, "dwell")
-        # K1 Max (Simple AF) defaults; change them on other machines
-        self.data_dir = config.get(
-            "data_dir", "/usr/data/printer_data/lidar")
-        self.gcode_dir = config.get(
-            "gcode_dir", "/usr/data/printer_data/gcodes")
+        data_dir, gcode_dir = _default_dirs(config)
+        self.data_dir = config.get("data_dir", data_dir)
+        self.gcode_dir = config.get("gcode_dir", gcode_dir)
         self.sock = None
         # optional helper computer running lidar_service.py ("host:port"):
         # the LiDAR captures and the analysis happen there, the K1 only
@@ -1930,7 +1941,8 @@ class Lidar:
                     "LIDAR_OFFSET_CALIBRATE", "LIDAR_TIMING",
                     "LIDAR_BED_MESH", "LIDAR_TWIST_CALIBRATE",
                     "LIDAR_GRID_CALIBRATE", "MESH_COMPARE", "MESH_BENCHMARK",
-                    "FIRST_LAYER_SCAN", "SKEW_SCAN", "SKEW_CALIBRATE"):
+                    "FIRST_LAYER_SCAN", "SKEW_SCAN", "SKEW_CALIBRATE",
+                    "LIDAR_SETUP_CHECK"):
             self.gcode.register_command(
                 cmd, getattr(self, "cmd_" + cmd),
                 desc=getattr(self, "desc_" + cmd))
@@ -2162,6 +2174,80 @@ class Lidar:
                 "work done by the service at " + self.service
                 if self.service else "work done on this printer",
                 ", ".join(sorted(self.scans)) or "none"))
+
+    offset_source = "config"
+
+    def setup_report(self):
+        """[(item, ok, text)]: what this printer's setup can do."""
+        err = (self.printer.command_error, OSError)
+        out = []
+        msg = {"control": "get_laser_exposure"}
+        try:
+            r = (self._svc({"cmd": "middleware", "msg": msg})["reply"]
+                 if self.service else self._call(msg))
+            out.append(("driver", True, "answers (exposure %s)" % (
+                r.get("result", {}).get("exposure"),)))
+        except err as e:
+            out.append(("driver", False, "no answer (%s)" % (e,)))
+        measured = self.offset_source != "config"
+        out.append(("offsets", measured, "X%.2f Y%.2f, %s" % (
+            self.x_offset, self.y_offset, self.offset_source if measured
+            else "from [lidar], not measured: LIDAR_OFFSET_CALIBRATION")))
+        timing = (self._saved().get("lidar_timing") or {}).get(
+            self._driver())
+        out.append(("timing", bool(timing), "saved for the %s driver"
+                    % (self._driver(),) if timing else
+                    "not measured: LIDAR_TIMING (dwell scans need it)"))
+        if not self.service:
+            out.append(("service", False, "not set: meshes, the first-layer"
+                        " check and dwell scans need it"))
+        else:
+            try:
+                self._svc({"cmd": "ping"})
+                out.append(("service", True, "answers at " + self.service))
+            except err as e:
+                out.append(("service", False, "%s: no answer (%s)"
+                            % (self.service, e)))
+        x0, x1, y0, y1 = self._laser_area(self.scan_z)
+        if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+            out.append(("area", False, "the LiDAR reaches no part of the bed"
+                        " (X%.1f-%.1f Y%.1f-%.1f): check x_offset/y_offset,"
+                        " mesh_min/mesh_max" % (x0, x1, y0, y1)))
+        else:
+            out.append(("area", True, "levels 1-3 X%.1f-%.1f Y%.1f-%.1f,"
+                        " levels 4-5 to X%.1f (at Z%.1f)" % (
+                            x0, x1, y0, y1, x1 + 14.0, self.scan_z)))
+        mode = self._touch_mode()
+
+        class _G:
+            error = self.printer.command_error
+        try:
+            self._touch_ready(_G())
+            out.append(("touch", True, mode + (
+                ": reference is the probe, less accurate than a nozzle"
+                " touch" if mode == "probe" else "")))
+        except self.printer.command_error as e:
+            out.append(("touch", False, "%s: %s (LIDAR_TWIST_CALIBRATE,"
+                        " LIDAR_GRID_CALIBRATE, level 5 and MESH_BENCHMARK"
+                        " need it)" % (mode, e)))
+        ko = self.printer.lookup_object("keep_out", None)
+        sk = self.printer.lookup_object("skew_correction", None)
+        out.append(("limits", True, "skew correction %s, keep-out zones %s"
+                    % ("on" if sk is not None else "off",
+                       "on" if ko is not None else "off")))
+        return out
+
+    desc_LIDAR_SETUP_CHECK = "What this printer's LiDAR setup can do"
+
+    def cmd_LIDAR_SETUP_CHECK(self, gcmd):
+        rep = self.setup_report()
+        lines = ["LiDAR setup (FreeTheBeam %s):" % (VERSION,)]
+        lines += ["  [%s] %s: %s" % ("ok" if ok else "--", item, text)
+                  for item, ok, text in rep]
+        missing = [item for item, ok, text in rep if not ok]
+        lines.append("missing: " + ", ".join(missing) if missing
+                     else "all set")
+        gcmd.respond_info("\n".join(lines))
 
     def _scan(self, name, x, y0, y1, step, z, captures):
         toolhead = self.printer.lookup_object("toolhead")
