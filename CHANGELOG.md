@@ -7,6 +7,18 @@ between minor versions).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-02
+
+### Fixed
+- **Switch macros on mainline Klipper.** `_LIDAR_START_PRINT_MESH`,
+  `_LIDAR_PRINT_SCAN` and `_FIRST_LAYER_OFFSET` in `lidar.example.cfg` read
+  the `[output_pin]` switches unguarded, so without virtual pins (mainline
+  Klipper) they stopped with an undefined-object error. Without a pin they
+  now read the saved variable (`sw_lidar_mesh`, `sw_first_layer_check`,
+  `sw_first_layer_learn`; set with `SAVE_VARIABLE`), off when unset.
+  Offline test: `klipper/tests/test_example_macros.py` renders the macros
+  with jinja2 (CI installs it; the test skips without it).
+
 ## [0.3.1] - 2026-11-02
 
 ### Fixed
@@ -147,7 +159,8 @@ First public release.
 - Helper service for a second computer, K1 Max boot script, protocol, pinout
   and install docs, offline tests with a fake module.
 
-[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.1.0...v0.2.0

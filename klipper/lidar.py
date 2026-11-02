@@ -142,7 +142,7 @@ import sys
 import time
 
 # FreeTheBeam release (also in driver/lidar_serial.py and CHANGELOG.md)
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 ETX = b"\x03"
 NAN = float("nan")

@@ -61,7 +61,10 @@ with 1 GB runs both next to Klipper. Check with
    (every option, commented) or [`config/ender3v3se.cfg`](../config/ender3v3se.cfg)
    (an example with a strain-gauge nozzle touch).
 3. Add the macros you want from [`klipper/lidar.example.cfg`](../klipper/lidar.example.cfg)
-   and a `[save_variables]` section.
+   and a `[save_variables]` section. Mainline Klipper has no virtual pins:
+   leave its three `[output_pin]` switches out; the macros then read the
+   saved variables instead (`SAVE_VARIABLE VARIABLE=sw_lidar_mesh VALUE=1`,
+   likewise `sw_first_layer_check`, `sw_first_layer_learn`).
 4. Set `zero_reference_position` in `[bed_mesh]` to where Z is homed or
    touched (see Limits below).
 5. Run `LIDAR_SETUP_CHECK`: it lists the driver, offsets, timing, service,

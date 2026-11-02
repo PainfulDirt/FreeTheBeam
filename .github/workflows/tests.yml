@@ -18,6 +18,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Test dependencies
+        # jinja2 renders the example macros like Klipper does
+        run: pip install jinja2
       - name: Compile
         run: python -m compileall -q driver klipper helper
       - name: Driver tests
