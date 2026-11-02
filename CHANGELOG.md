@@ -7,6 +7,52 @@ between minor versions).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-02
+
+Support for any Cartesian/CoreXY Klipper printer with the module mounted on
+the toolhead. The K1 Max behaves as before (offline regression tests) once
+its settings are in its config, see **Upgrading** below.
+
+### Added
+- **Laser area from the printer**: meshes and calibrations use the travel
+  limits shifted by the laser offset instead of K1 Max constants; optional
+  `mesh_min` / `mesh_max` narrow it, `twist_y` / `ytwist_x` place the
+  calibration lines, `mesh_max_count` limits mesh points.
+- **Touch methods** (`touch:` in `[lidar]`): `load_cell` (Kalico load cells,
+  as before), `probe` (any probe, moved over the spot), `gcode` (your own
+  nozzle-touch command, contact Z from `touch_result: object:key`), `none`.
+  `touch_temp` and `touch_wipe_gcode` replace the Simple AF macro lookups.
+- `LIDAR_SETUP_CHECK`: driver, offsets, timing, service, reachable area and
+  touch method, with what is missing.
+- `host/`: systemd unit, udev rule and installer for the driver on a Linux
+  Klipper host; `--helper` also installs the helper on the same host.
+- `lidar_service.py --socket`: the helper talks to the driver's unix socket
+  directly (no bridge) when both run on one host.
+- Printer configs: `config/generic.cfg` (every option), `config/ender3v3se.cfg`,
+  `k1max/lidar-k1max.cfg`; guide [install-other-printer](docs/install-other-printer.md).
+- Tests: laser area, calibration defaults, touch methods, setup check, the
+  helper's socket mode (`klipper/tests/test_any_printer.py`,
+  `helper/tests/`).
+
+### Changed
+- `data_dir` / `gcode_dir` default to Klipper's `[virtual_sdcard] path`
+  (`.../gcodes` and `.../lidar`); the K1 paths are the fallback.
+- `klipper/lidar.example.cfg` is printer-neutral; the K1's `[lidar]`,
+  `LIDAR_DRIVER` and shell command moved to `k1max/lidar-k1max.cfg`.
+- `MESH_BENCHMARK`'s default area is the whole laser area (K1 Max: X5-270
+  Y5-265, was X20-265 Y25-265).
+- Zero reference fallback: the laser area's centre (was the K1's 153, 173.3).
+
+### Fixed
+- Moving-scan meshes on mainline Klipper (`chelper` was imported the
+  Kalico way only).
+
+### Upgrading (K1 Max)
+Add `k1max/lidar-k1max.cfg` (or its `mesh_min`, `mesh_max`, `twist_y`,
+`ytwist_x`, `touch`, `touch_temp`, `touch_wipe_gcode` lines) to your config.
+Without them meshes would use the whole travel, into the keep-out zones at
+the back.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added
@@ -69,6 +115,7 @@ First public release.
 - Helper service for a second computer, K1 Max boot script, protocol, pinout
   and install docs, offline tests with a fake module.
 
-[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PainfulDirt/FreeTheBeam/releases/tag/v0.1.0
