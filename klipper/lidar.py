@@ -118,7 +118,8 @@
 #       MESH_BENCHMARK_RUN (lidar.example.cfg: soak first)
 #   FIRST_LAYER_SCAN PHASE=before|after|cancel  first-layer check: before
 #       scans the bare plate under the file's objects (exclude_object) +
-#       [MARGIN=8], strips 26mm apart, rows [STEP=2] (coarser until one scan
+#       [MARGIN=8], strips 26mm apart ([STRIP_SHIFT=0] moves them, a test),
+#       rows [STEP=2] (coarser until one scan
 #       fits [MAX_TIME=120]s), [HEIGHT=] sliced first layer, FILAMENT_TYPE=,
 #       FILAMENT_NAME=; after (layer 2, or FINAL=1 from END_PRINT for
 #       one-layer prints) retracts [RETRACT=1], lets the nozzle cool by
@@ -141,7 +142,7 @@ import sys
 import time
 
 # FreeTheBeam release (also in driver/lidar_serial.py and CHANGELOG.md)
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 ETX = b"\x03"
 NAN = float("nan")
@@ -310,6 +311,25 @@ def pa_fit(ys, A, test):
         else res.get("reason")))
     res["report"] = report
     return res
+
+
+def quad_fit(pts):
+    """Least squares d = c0 + c1 u + c2 v + c3 u^2 + c4 u v + c5 v^2 through
+    (x, y, d) points, u = (x - 150) / 150, v = (y - 150) / 150."""
+    rows = []
+    for x, y, d in pts:
+        u, v = (x - 150.0) / 150.0, (y - 150.0) / 150.0
+        rows.append(([1.0, u, v, u * u, u * v, v * v], d))
+    ata = [[sum(r[i] * r[k] for r, d in rows) for k in range(6)]
+           for i in range(6)]
+    atb = [sum(r[i] * d for r, d in rows) for i in range(6)]
+    return solve(ata, atb)
+
+
+def quad_eval(c, x, y):
+    u, v = (x - 150.0) / 150.0, (y - 150.0) / 150.0
+    return c[0] + c[1] * u + c[2] * v + c[3] * u * u + c[4] * u * v \
+        + c[5] * v * v
 
 
 def plane_fit(pts):
@@ -1282,9 +1302,62 @@ def fl_analyze(plan, before, after, cell=0.5, erode=2.0, bare_gap=3.0,
         mad = median([abs(v) for v in r]) or 1e-3
         bare = [p for p, v in zip(bare, r) if abs(v) <= 4.0 * mad + 0.005]
         pl = plane_fit(bare)
-    r = [p[2] - (pl[0] + pl[1] * p[0] + pl[2] * p[1]) for p in bare]
+    # The plate's change between the scans can be curved: a bowl of ~30 um
+    # across X and Y, the middle lower, on every 9-pad test print
+    # (2026-11-01/02; the bare plate between the pads showed it as well as
+    # the pads, a contact probe found the pads even). With bare plate inside
+    # the objects' area in all four quarters, a quadratic surface comes off
+    # instead of the plane; a single big part keeps the plane (nothing to
+    # fit it on in its middle).
+    drift = lambda x, y: pl[0] + pl[1] * x + pl[2] * y
+    quad, bowl = None, 0.0
+    # bare plate inside an outline too (gaps between the islands of one
+    # object): cells far below the layer, no printed cell within ~3 mm
+    tp = [[v - drift(x, y) if v == v else NAN for x, v in zip(cx, row)]
+          for y, row in zip(ys, t)]
+    hi = [[v == v and v > 0.4 * h0 for v in row] for row in tp]
+    reach = int(round(3.0 / cell))
+    near = []
+    for j in range(len(ys)):
+        rows = [hi[k] for k in range(max(0, j - 1), min(len(ys), j + 2))]
+        acc = [0] * (ncell + 1)
+        for c in range(ncell):
+            acc[c + 1] = acc[c] + any(r[c] for r in rows)
+        near.append([acc[min(ncell, c + reach + 1)] - acc[max(0, c - reach)]
+                     > 0 for c in range(ncell)])
+    gaps = [(x, ys[j], t[j][c]) for j in range(len(ys))
+            for c, x in enumerate(cx)
+            if where[j][c][0] >= 0 and tp[j][c] == tp[j][c]
+            and tp[j][c] < 0.25 * h0 and not near[j][c]]
+    if gaps:
+        bare = bare + gaps
+    allp = [q for pg in polys for q in pg]
+    bx0, bx1 = min(q[0] for q in allp), max(q[0] for q in allp)
+    by0, by1 = min(q[1] for q in allp), max(q[1] for q in allp)
+    mx, my = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+    quarters = [0, 0, 0, 0]
+    for p in bare:
+        if bx0 <= p[0] <= bx1 and by0 <= p[1] <= by1:
+            quarters[(p[0] >= mx) + 2 * (p[1] >= my)] += 1
+    if min(quarters) >= 100:
+        quad = quad_fit(bare)
+        for it in range(2):
+            r = [p[2] - quad_eval(quad, p[0], p[1]) for p in bare]
+            mad = median([abs(v) for v in r]) or 1e-3
+            bare = [p for p, v in zip(bare, r)
+                    if abs(v) <= 4.0 * mad + 0.005]
+            quad = quad_fit(bare)
+        drift = lambda x, y: quad_eval(quad, x, y)
+        # how far the curve is from a plane over the area
+        grid = [(bx0 + (bx1 - bx0) * i / 4.0, by0 + (by1 - by0) * j / 4.0)
+                for i in range(5) for j in range(5)]
+        lin = plane_fit([(x, y, drift(x, y)) for x, y in grid])
+        dev = [drift(x, y) - (lin[0] + lin[1] * x + lin[2] * y)
+               for x, y in grid]
+        bowl = max(dev) - min(dev)
+    r = [p[2] - drift(p[0], p[1]) for p in bare]
     bare_rms = math.sqrt(sum(v * v for v in r) / len(r))
-    tc = [[v - (pl[0] + pl[1] * x + pl[2] * y) if v == v else NAN
+    tc = [[v - drift(x, y) if v == v else NAN
            for x, v in zip(cx, row)] for y, row in zip(ys, t)]
     # printed cells, then their neighbours along X and Y must be printed too
     pr = [[where[j][c][0] >= 0 and where[j][c][1] >= erode
@@ -1360,7 +1433,10 @@ def fl_analyze(plan, before, after, cell=0.5, erode=2.0, bare_gap=3.0,
         "drift": {"plane": [round(pl[0] + pl[1] * (cx[0] + cx[-1]) / 2
                                   + pl[2] * (ys[0] + ys[-1]) / 2, 4),
                             round(pl[1] * 1e5, 2), round(pl[2] * 1e5, 2)],
-                  "bare_cells": len(bare), "bare_rms": round(bare_rms, 4)},
+                  "bare_cells": len(bare), "bare_rms": round(bare_rms, 4),
+                  # quadratic: the curved part taken off as well (mm)
+                  "surface": "quadratic" if quad else "plane",
+                  "bowl": round(bowl, 4)},
         "coarse": coarse_map})
     out = {"x0": cx[0], "dx": cell, "ys": ys, "unit": "um",
            "t": [[int(round(d * 1000.0)) if d == d else None for d in row]
@@ -4209,6 +4285,13 @@ class Lidar:
             gcmd.respond_info("First-layer check: the objects are out of the"
                               " LiDAR's reach, skipped")
             return
+        # STRIP_SHIFT (mm, test): every strip moved sideways, so the parts
+        # are seen by other places along the line (centre vs ends)
+        shift = gcmd.get_float("STRIP_SHIFT", 0.0, minval=-14.0, maxval=14.0)
+        if shift:
+            plan["strips"] = [round(x + shift, 2) for x in plan["strips"]]
+            gcmd.respond_info("First-layer check: strips shifted by %+.1fmm"
+                              % (shift,))
         try:
             self._check_reach(gcmd, [(x, plan["y0"], x, plan["y1"])
                                      for x in plan["strips"]], z)
@@ -4369,10 +4452,13 @@ class Lidar:
         gcmd.respond_info(
             "First-layer check: %.3fmm measured for %.3fmm sliced (%+.3f),"
             " p05-p95 %.3f-%.3f over %.0f mm2; tilt X %+.0f Y %+.0f"
-            " um/100mm; plate drift between the scans %+.0f um" % (
+            " um/100mm; plate drift between the scans %+.0f um%s" % (
                 res["median"], h, res["error"], res["p05"], res["p95"],
                 res["area_mm2"], res["tilt_um_per_100mm"][0],
-                res["tilt_um_per_100mm"][1], res["drift"]["plane"][0] * 1000))
+                res["tilt_um_per_100mm"][1], res["drift"]["plane"][0] * 1000,
+                ", curved by %.0f um (taken off)" % (
+                    res["drift"]["bowl"] * 1000)
+                if res["drift"].get("surface") == "quadratic" else ""))
         for o in res["objects"][:6]:
             gcmd.respond_info("  %s: %.3fmm (%d cells)" % (
                 o["name"], o["median"], o["cells"]))

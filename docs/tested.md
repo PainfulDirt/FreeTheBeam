@@ -45,6 +45,7 @@ normal prints since then.
 |---|---|---|
 | `FIRST_LAYER_SCAN` (`First_Layer_Check`) | 2026-10-29, in use | 0.194 mm measured for 0.200 mm sliced; per-pad values in 4 A/B prints |
 | Prime line after the scan pause | 2026-11-01 | Layer 2 starts clean |
+| Curved plate drift between the scans (0.3.1) | 2026-11-02, two 9-pad prints re-analysed | The bare plate between the pads showed a 40-60 um bowl; taken off as a quadratic surface the pads spread 6.1 / 7.5 um rms instead of 16.2 / 23.3, median 0.204 mm for 0.200 (a contact probe on the pads agreed); a strip-shift print ruled out the laser line itself |
 | `First_Layer_Learn` (Z offset per filament) | in use since 2026-10-31 | |
 
 ## K1 Max extras (`k1max/k1max-extras.cfg`)

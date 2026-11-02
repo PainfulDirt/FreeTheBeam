@@ -7,6 +7,25 @@ between minor versions).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-02
+
+### Fixed
+- **First-layer check read the middle of the area too thin.** The plate's
+  change between the two scans can be bowl-shaped (40-60 um, middle lower,
+  seen on the bare plate between the pads of 9-pad test prints on the K1
+  Max), and only a plane was taken off, so parts in the middle read 25-38 um
+  thinner than they were. Gaps inside an object's outline now count as bare
+  plate too, and with bare plate in all four quarters of the objects' area
+  a quadratic surface comes off instead (console: "curved by N um"; report:
+  `drift.surface`, `drift.bowl`). A single solid part keeps the plane.
+  Re-analysed test prints: pad spread 16-23 -> 6-8 um rms, median 0.192 ->
+  0.204 mm for 0.200. Learned Z offsets (`First_Layer_Learn`) from before
+  may carry the old error: clear `fl_zoffset` to let them learn again.
+
+### Added
+- `FIRST_LAYER_SCAN STRIP_SHIFT=` (test option): moves the scan strips
+  sideways, to tell the laser line's own errors from the plate's.
+
 ## [0.3.0] - 2026-11-02
 
 Support for any Cartesian/CoreXY Klipper printer with the module mounted on
@@ -128,7 +147,8 @@ First public release.
 - Helper service for a second computer, K1 Max boot script, protocol, pinout
   and install docs, offline tests with a fake module.
 
-[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PainfulDirt/FreeTheBeam/releases/tag/v0.1.0
