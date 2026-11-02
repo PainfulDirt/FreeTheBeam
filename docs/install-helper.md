@@ -6,7 +6,7 @@ Klipper. Only LiDAR data takes this path; Klipper stays on the printer.
 
 When Klipper itself runs on a normal Linux host with the module on its USB
 (not a K1), the helper runs on that same host instead:
-`sh host/install.sh <klipper user> --helper` and `service: 127.0.0.1:7131`
+`sh host/install.sh <klipper user> --helper` and `service: 127.0.0.1:7132`
 ([install-other-printer.md](install-other-printer.md)). The steps below are
 for a K1 with a separate helper.
 

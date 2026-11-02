@@ -1,0 +1,18 @@
+# FreeTheBeam: the helper service (captures, meshes, analysis) on the same
+# Linux host as Klipper and the driver. Installed by host/install.sh --helper.
+[Unit]
+Description=FreeTheBeam LiDAR helper (lidar_service.py)
+After=lidar-direct.service
+Wants=lidar-direct.service
+
+[Service]
+User=KLIPPER_USER
+# the driver's socket is in the normal /tmp
+PrivateTmp=no
+ExecStart=/usr/bin/python3 /opt/freethebeam/helper/lidar_service.py --socket /tmp/ai_server_uds --listen 127.0.0.1:7132 --allow 127.0.0.1 --data /var/lib/lidar-helper
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

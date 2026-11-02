@@ -26,5 +26,7 @@ jobs:
         run: python -m unittest discover -s klipper/tests -v
       - name: Helper tests
         run: python -m unittest discover -s helper/tests -v
+      - name: Host install test
+        run: python -m unittest discover -s host/tests -v
       - name: Shell syntax
         run: sh -n k1max/lidar-start.sh && sh -n helper/install.sh && sh -n host/install.sh

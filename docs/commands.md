@@ -14,7 +14,7 @@ see [install-helper.md](install-helper.md)); *touch* = a touch method
 | Command | What it does | Needs |
 |---|---|---|
 | `LIDAR_STATUS` | Checks that the driver answers; prints the version, offsets, where the work runs and the scans in memory. | |
-| `LIDAR_SETUP_CHECK` | What this printer's setup can do: driver, offsets measured or not, timing, service, the area the LiDAR reaches, the touch method, skew/keep-out; ends with what is missing. | |
+| `LIDAR_SETUP_CHECK` | What this printer's setup can do: driver, offsets measured or not, timing, service, the area the LiDAR reaches (levels 1-3 and 4-5), `zero_reference_position`, the touch method, skew/keep-out; ends with what is missing. | |
 | `LIDAR_TIMING [Z=3] [DZ=1.5] [SPEED=5] [CYCLES=15] [LEVELS=0,1] [APPLY=1]` | Measures the frame period and the time window a frame covers (slow Z moves over a flat plate) and saves them as `lidar_timing` for dwell scans. Run once per driver. | service, homed |
 
 ## Scanning

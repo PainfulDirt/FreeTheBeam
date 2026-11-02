@@ -29,17 +29,26 @@ calibrations. The K1 Max has its own guide: [install-k1max.md](install-k1max.md)
 
 ## 2. Install the driver on the Klipper host
 
-On the host (Raspberry Pi, PC), as root, from a checkout of this repo:
+On the host (Raspberry Pi, PC), as root, from a checkout of this repo, with
+the module plugged in:
 
 ```
 sh host/install.sh <klipper user> --helper
 ```
 
+The udev rule is pinned to the module's USB serial number, because printer
+boards can use the same USB chip (CH343, `1a86:55d3`) and the driver must
+never open one of them. The installer stops if it finds no such device or
+more than one; then give the module's serial as `SERIAL=... sh
+host/install.sh ...` (`udevadm info -a /dev/ttyACMx | grep serial`).
+
 This installs the udev rule (`/dev/serial/by-id/creality-laser`, group
 `dialout`), the driver as the systemd service `lidar-direct` (socket
-`/tmp/ai_server_uds`), and with `--helper` the helper service `k1-lidar` on
-the same host (127.0.0.1:7131, talking to the driver's socket directly). A
-Pi 4 with 1 GB runs both next to Klipper. Check with
+`/tmp/ai_server_uds`), and with `--helper` the helper service `lidar-helper`
+on the same host (127.0.0.1:7132, talking to the driver's socket directly,
+data in `/var/lib/lidar-helper`). It leaves a `k1-lidar` service alone, so a
+Pi that is already a K1's helper can also be another printer's host. A Pi 4
+with 1 GB runs both next to Klipper. Check with
 `systemctl status lidar-direct` and `python3 driver/examples/dump_profile.py`
 (with something flat under the module).
 
@@ -53,8 +62,11 @@ Pi 4 with 1 GB runs both next to Klipper. Check with
    (an example with a strain-gauge nozzle touch).
 3. Add the macros you want from [`klipper/lidar.example.cfg`](../klipper/lidar.example.cfg)
    and a `[save_variables]` section.
-4. Run `LIDAR_SETUP_CHECK`: it lists the driver, offsets, timing, service,
-   the area the LiDAR can reach and the touch method, and what is missing.
+4. Set `zero_reference_position` in `[bed_mesh]` to where Z is homed or
+   touched (see Limits below).
+5. Run `LIDAR_SETUP_CHECK`: it lists the driver, offsets, timing, service,
+   the area the LiDAR can reach, the zero reference and the touch method,
+   and what is missing.
 
 ## 4. Touch method
 
@@ -95,6 +107,8 @@ With the printer homed and the plate clear:
 - `mesh_min` / `mesh_max` keep meshes and calibrations clear of clips,
   wipers or anything else on the bed edge; keep-out zones need
   `keep_out.py` ([install-k1max.md](install-k1max.md#6-k1-max-extras-optional)).
-- The LiDAR has no absolute height: meshes are made 0 at
-  `zero_reference_position` (or the area centre), where Z must come from
-  your normal homing / probe.
+- The LiDAR has no absolute height: meshes are made 0 at `[bed_mesh]
+  zero_reference_position`, which must be where Z is homed or touched.
+  **Set it**: without it LiDAR meshes are only made relative to their
+  median, and the first layer is off by the bed's height at the Z home spot.
+  `LIDAR_SETUP_CHECK` reports it.

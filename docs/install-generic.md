@@ -18,7 +18,10 @@ thing done by hand; if your distro disagrees, believe your distro.
    SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", SYMLINK+="serial/by-id/creality-laser", MODE="0660", GROUP="dialout"
    ```
 
-   then `sudo udevadm control --reload && sudo udevadm trigger`.
+   then `sudo udevadm control --reload && sudo udevadm trigger`. If any
+   other device on this computer uses the same chip (`lsusb | grep 1a86:55d3`
+   shows more than one), add `ATTRS{serial}=="<the module's serial>"` to the
+   rule: the driver must never open a printer board's port.
 3. **Permissions.** Add yourself to the `dialout` group (or whichever group
    owns the device) and log in again.
 4. **Run the driver.**

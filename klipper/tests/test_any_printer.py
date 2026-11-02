@@ -237,5 +237,91 @@ class TestMainline(unittest.TestCase):
                     sys.modules[k] = v
 
 
+class TestReviewFixes(unittest.TestCase):
+    """Findings of the 0.3.0 review."""
+    def fits(self, L, pts, z=None):
+        L._check_reach(Gcmd(), [tuple(p) * 2 if len(p) == 2 else p
+                                for p in pts], z)
+
+    def test_benchmark_area_reachable_by_probe(self):
+        L, log, objs = make_lidar(probe_offsets=(0.0, 20.3), load_cell=True,
+                                  **K1)
+        a = L._bench_area(Gcmd(), ["probe", "1"])
+        self.assertGreaterEqual(a["y0"], 18.3 + 0.5)
+        self.assertEqual((a["x0"], a["x1"], a["y1"]), (5.0, 270.0, 265.0))
+        # without the probe method the whole laser area
+        self.assertEqual(L._bench_area(Gcmd(), ["1", "2"])["y0"], 5.0)
+
+    def test_benchmark_checks_touch_first(self):
+        L, log, objs = make_lidar(**SMALL)
+        with self.assertRaises(Err) as cm:
+            L.cmd_MESH_BENCHMARK(Gcmd(methods="1,2"))
+        self.assertIn("needs a touch method ([lidar] touch:)",
+                      str(cm.exception))
+        self.assertEqual(log, [])
+
+    def test_probe_calibration_defaults_reachable(self):
+        L, log, objs = make_lidar(probe_offsets=(0.0, 20.3), **SMALL)
+        g = Gcmd()
+        for axis in ("X", "Y"):
+            spots = L._twist_spots(g, axis, 3.0)
+            self.fits(L, [L._touch_xy(x, y) for x, y in spots])
+        xs, ys = L._grid_axes(g, 3.0, 7, 5)
+        self.fits(L, [L._touch_xy(x, y) for x in xs for y in ys])
+
+    def test_probe_touch_approach_above_trigger(self):
+        L, log, objs = make_lidar(probe_offsets=(0.0, 20.3, 2.561), **SMALL)
+        L.touch_grid(Gcmd(), [(100.0, 100.0)], 1, 0, ref=(110.0, 110.0))
+        self.assertIn("G0 Z4.56 F900", log)
+        self.assertNotIn("G0 Z2 F900", log)
+        L, log, objs = make_lidar(load_cell=True, **SMALL)
+        L.touch_grid(Gcmd(), [(100.0, 100.0)], 1, 0, ref=(110.0, 110.0))
+        self.assertIn("G0 Z2.00 F900", log)
+
+    def test_setup_reports_zero_ref(self):
+        L, log, objs = make_lidar(load_cell=True, **SMALL)
+        L._svc = lambda req, timeout=30.0: {"ok": True, "reply": {}}
+        r = dict((i, ok) for i, ok, t in L.setup_report())
+        self.assertFalse(r["zero_ref"])
+        L, log, objs = make_lidar(load_cell=True, zero_ref=(100.0, 100.0),
+                                  **SMALL)
+        L._svc = lambda req, timeout=30.0: {"ok": True, "reply": {}}
+        r = dict((i, ok) for i, ok, t in L.setup_report())
+        self.assertTrue(r["zero_ref"])
+
+    def test_fine_x_follows_the_laser_side(self):
+        L, log, objs = make_lidar(**K1)
+        self.assertEqual(L._fine_x(3.0), (4.0, 284.0))
+        L, log, objs = make_lidar(axis_min=(0.0, 0.0),
+                                  axis_max=(230.0, 225.0), offset=(30.0, 20.0))
+        self.assertEqual(L._fine_x(3.0), (16.5, 230.0))
+
+    def test_print_tests_k1_defaults_kept(self):
+        L, log, objs = make_lidar(**K1)
+        g = Gcmd()
+        self.assertEqual(L._pa_place(g, 9), (130.0, 100.0))
+        self.assertEqual(L._creality_place(g), (170.0, 60.0))
+        self.assertEqual(L._cross_place(g, 3.0, 5.0), (150.0, 150.0))
+
+    def test_print_tests_small_bed_placed_inside(self):
+        L, log, objs = make_lidar(**SMALL)
+        g = Gcmd()
+        x0, y0 = L._pa_place(g, 9)
+        self.assertNotEqual((x0, y0), (130.0, 100.0))
+        ox, oy = L._creality_place(g)
+        self.fits(L, [(ox, oy), (ox + 27.0, oy + 139.0)])
+        L, log, objs = make_lidar(axis_min=(0.0, 0.0),
+                                  axis_max=(160.0, 160.0),
+                                  offset=(-36.0, -21.2))
+        self.assertEqual(L._cross_place(g, 3.0, 5.0), (62.0, 69.4))
+
+    def test_print_tests_explicit_out_of_reach_refused(self):
+        L, log, objs = make_lidar(**SMALL)
+        with self.assertRaises(Err):
+            L._pa_place(Gcmd(x=200, y=150), 9)
+        with self.assertRaises(Err):
+            L._creality_place(Gcmd(x=210, y=150))
+
+
 if __name__ == "__main__":
     unittest.main()

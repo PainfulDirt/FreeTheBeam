@@ -2214,9 +2214,20 @@ class Lidar:
                         " (X%.1f-%.1f Y%.1f-%.1f): check x_offset/y_offset,"
                         " mesh_min/mesh_max" % (x0, x1, y0, y1)))
         else:
+            fx = self._fine_x(self.scan_z)
             out.append(("area", True, "levels 1-3 X%.1f-%.1f Y%.1f-%.1f,"
-                        " levels 4-5 to X%.1f (at Z%.1f)" % (
-                            x0, x1, y0, y1, x1 + 14.0, self.scan_z)))
+                        " levels 4-5 X%.1f-%.1f (at Z%.1f)" % (
+                            x0, x1, y0, y1, fx[0], fx[1], self.scan_z)))
+        bm = self.printer.lookup_object("bed_mesh", None)
+        ref = bm.bmc.zero_ref_pos if bm is not None else None
+        if ref is None:
+            out.append(("zero_ref", False, "no [bed_mesh]"
+                        " zero_reference_position: LiDAR meshes are then"
+                        " made relative to their median, not to where Z"
+                        " is homed; set it to your Z homing / touch spot"))
+        else:
+            out.append(("zero_ref", True, "X%.1f Y%.1f (meshes are 0 there)"
+                        % (ref[0], ref[1])))
         mode = self._touch_mode()
 
         class _G:
@@ -2691,12 +2702,61 @@ class Lidar:
                 " and mesh_min/mesh_max in [lidar]" % (x0, x1, y0, y1, z))
         return area
 
+    def _probe_reach(self, area):
+        """area (x0, x1, y0, y1) narrowed to where the probe can go: it
+        touches (x, y) with the nozzle at (x, y) - its offsets."""
+        st = self.printer.lookup_object("toolhead").get_status(
+            self.reactor.monotonic())
+        lo, hi = st["axis_minimum"], st["axis_maximum"]
+        off = self.printer.lookup_object("probe").get_offsets()
+        out = list(area)
+        for i in (0, 1):
+            out[2 * i] = round(max(out[2 * i], lo[i] + off[i] + 0.5), 3)
+            out[2 * i + 1] = round(min(out[2 * i + 1], hi[i] + off[i] - 0.5),
+                                   3)
+        return tuple(out)
+
+    def _touch_area(self, gcmd, z):
+        """The laser area where the touch method can also touch."""
+        area = self._area_or_error(gcmd, z)
+        if self._touch_mode() == "probe" and self.printer.lookup_object(
+                "probe", None) is not None:
+            area = self._probe_reach(area)
+            if area[1] - area[0] < 1.0 or area[3] - area[2] < 1.0:
+                raise gcmd.error("LiDAR: the probe can touch nowhere the"
+                                 " LiDAR can see")
+        return area
+
+    def _fine_x(self, z):
+        """X range of levels 4-5 (strips): the laser line reaches 14mm past
+        its centre on the side away from the nozzle (K1 Max: right),
+        within the travel."""
+        ax0, ax1 = self._laser_area(z)[:2]
+        st = self.printer.lookup_object("toolhead").get_status(
+            self.reactor.monotonic())
+        lo, hi = st["axis_minimum"][0], st["axis_maximum"][0]
+        xo = self._xo(z)
+        left, right = (14.0, 1.0) if xo > 0 else (1.0, 14.0)
+        return (round(max(ax0 - left, lo), 3), round(min(ax1 + right, hi), 3))
+
+    def _bench_area(self, gcmd, methods):
+        """MESH_BENCHMARK's default area: the laser area, where the probe
+        reaches too if it is one of the methods."""
+        area = self._area_or_error(gcmd, self.scan_z)
+        if "probe" in methods and self.printer.lookup_object(
+                "probe", None) is not None:
+            area = self._probe_reach(area)
+        return {"x0": gcmd.get_float("X0", area[0]),
+                "x1": gcmd.get_float("X1", area[1]),
+                "y0": gcmd.get_float("Y0", area[2]),
+                "y1": gcmd.get_float("Y1", area[3])}
+
     def _twist_spots(self, gcmd, axis, z):
         """LIDAR_TWIST_CALIBRATE's spots (laser = nozzle touch coordinates):
         AXIS=X a line along X at twist_y (default: the area's Y centre),
         AXIS=Y lines along Y at ytwist_x (default: 1/3 and 2/3 of the
-        area's X)."""
-        ax0, ax1, ay0, ay1 = self._area_or_error(gcmd, z)
+        area's X), within what the touch method reaches."""
+        ax0, ax1, ay0, ay1 = self._touch_area(gcmd, z)
         if axis == "X":
             n = gcmd.get_int("POINTS", 7, minval=3, maxval=15)
             y = gcmd.get_float("Y", self.twist_y if self.twist_y is not None
@@ -2727,8 +2787,9 @@ class Lidar:
 
     def _grid_axes(self, gcmd, z, nx, ny):
         """LIDAR_GRID_CALIBRATE's columns and rows: the area, 5mm in from
-        its left edge and 1mm in along Y."""
-        ax0, ax1, ay0, ay1 = self._area_or_error(gcmd, z)
+        its left edge and 1mm in along Y, within what the touch method
+        reaches."""
+        ax0, ax1, ay0, ay1 = self._touch_area(gcmd, z)
         y0 = gcmd.get_float("Y0", ay0 + 1.0)
         y1 = gcmd.get_float("Y1", ay1 - 1.0)
         x0 = gcmd.get_float("X0", ax0 + 5.0)
@@ -2793,6 +2854,13 @@ class Lidar:
             off = self.printer.lookup_object("probe").get_offsets()
             return x - off[0], y - off[1]
         return x, y
+
+    def _touch_start_z(self):
+        """Nozzle Z to start a touch from: 2mm above the bed, or 2mm above
+        where a probe triggers."""
+        if self._touch_mode() == "probe":
+            return self.printer.lookup_object("probe").get_offsets()[2] + 2.0
+        return 2.0
 
     def _touch(self, samples):
         """Touch at the current position; the contact Z (median of
@@ -3011,7 +3079,8 @@ class Lidar:
         reaches."""
         ax0, ax1, y0, y1 = self._area_or_error(gcmd, o["z"])
         # strips (fine) look 14mm either side of their centre line
-        x0, x1 = (ax0 - 1.0, ax1 + 14.0) if fine else (ax0, ax1)
+        x0, x1 = self._fine_x(o["z"]) if fine else (ax0, ax1)
+        fx0 = x0
         # strips (fine) reach 14mm past their centre line
         rx0, rx1 = self._reach_x(y0, y1, o["z"], 0.3)
         w = 14.0 if fine else 0.0
@@ -3052,7 +3121,7 @@ class Lidar:
         if x1 - x0 < 20.0 or y1 - y0 < 20.0:
             # bicubic needs 4 points a side; keep at least 20mm
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            x0, x1 = max(cx - 10.0, ax0 - 1.0 if fine else ax0), \
+            x0, x1 = max(cx - 10.0, fx0), \
                 max(cx + 10.0, x0 + 20.0)
             y0, y1 = cy - 10.0, cy + 10.0
         return x0, x1, y0, y1
@@ -3079,8 +3148,9 @@ class Lidar:
         if not fine and dwell:
             n = dn
         ax0, ax1, ay0, ay1 = self._laser_area(z)
-        nx, ny = self._counts(o, n, x0, x1, y0, y1,
-                              ax1 - ax0 + (15.0 if fine else 0.0), ay1 - ay0)
+        if fine:
+            ax0, ax1 = self._fine_x(z)
+        nx, ny = self._counts(o, n, x0, x1, y0, y1, ax1 - ax0, ay1 - ay0)
         xs, ys = self._grid(x0, x1, nx), self._grid(y0, y1, ny)
         twist, yt, tnote = self._lidar_tables() if o["twist"] else (
             None, None, "")
@@ -3190,7 +3260,9 @@ class Lidar:
         # covering the mesh area
         x0, x1, y0, y1 = xs[0], xs[-1], ys[0], ys[-1]
         rx1 = min(self._laser_area(z)[1], self._reach_x(y0, y1, z, 0.3)[1])
-        sx0 = o.get("strip_x0", max(x0 + 13.5, min(18.0, rx1)))
+        # the first strip's line starts at the fine area's left edge
+        sx0 = o.get("strip_x0", max(x0 + 13.5, min(
+            self._fine_x(z)[0] + 14.0, rx1)))
         sx1 = o.get("strip_x1", min(max(x1 - 13.5, sx0), rx1))
         ns = o.get("strips", max(1, int(math.ceil((sx1 - sx0) / 28.0)) + 1))
         step = o.get("step", 2.0)
@@ -3251,6 +3323,7 @@ class Lidar:
         cells; a few seconds don't cool the bed). Returns [(x, y, z, time,
         is_ref)]."""
         self._touch_ready(gcmd)
+        zt = self._touch_start_z()
         bm = self.printer.lookup_object("bed_mesh")
         if ref is None:
             ref = bm.bmc.zero_ref_pos
@@ -3281,13 +3354,13 @@ class Lidar:
         try:
             run("G90\nG0 Z5 F900")
             # the first nozzle tap after a wipe reads off: throw it away
-            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%s" % (
-                self._touch_xy(*ref) + (off,)))
+            run("G0 X%.2f Y%.2f F9000\nG0 Z%.2f F900\n%s" % (
+                self._touch_xy(*ref) + (zt, off)))
             self._touch(1)
             run("%sG0 Z5 F900" % (on,))
             for k, (x, y) in enumerate(order):
-                run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%s" % (
-                    self._touch_xy(x, y) + (off,)))
+                run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z%.2f F900\n%s" % (
+                    self._touch_xy(x, y) + (zt, off)))
                 nz = self._touch(samples)
                 run("%sG0 Z5 F900" % (on,))
                 out.append((x, y, nz, self.reactor.monotonic(),
@@ -3553,12 +3626,10 @@ class Lidar:
             raise gcmd.error("MESH_BENCHMARK needs the lidar service")
         methods = [m.strip().lower() for m in gcmd.get(
             "METHODS", "probe,1,2,3,4,5,repeat2").split(",") if m.strip()]
-        ax0, ax1, ay0, ay1 = self._area_or_error(gcmd, self.scan_z)
-        area = {"x0": gcmd.get_float("X0", ax0),
-                "x1": gcmd.get_float("X1", ax1),
-                "y0": gcmd.get_float("Y0", ay0),
-                "y1": gcmd.get_float("Y1", ay1)}
         nt = gcmd.get_int("TRUTH", 6, minval=0, maxval=10)
+        if nt or "5" in methods:
+            self._touch_ready(gcmd)
+        area = self._bench_area(gcmd, methods)
         bm = self.printer.lookup_object("bed_mesh")
         atc = self.printer.lookup_object("axis_twist_compensation", None)
         run = self.gcode.run_script_from_command
@@ -3722,6 +3793,7 @@ class Lidar:
         if state in ("printing", "paused"):
             raise gcmd.error("LiDAR: not while a print is running")
         self._touch_ready(gcmd)
+        zt = self._touch_start_z()
         z = gcmd.get_float("Z", self.scan_z)
         axis = gcmd.get("AXIS", "X").upper()
         if axis not in ("X", "Y"):
@@ -3766,14 +3838,14 @@ class Lidar:
         try:
             run("G90\nG0 Z5 F900")
             # the first nozzle tap after a wipe reads off: throw it away
-            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900" % self._touch_xy(
-                *spots[0]))
+            run("G0 X%.2f Y%.2f F9000\nG0 Z%.2f F900" % (
+                self._touch_xy(*spots[0]) + (zt,)))
             self._touch(1)
             run("G0 Z5 F900")
             for p in range(passes):
                 for x, y in (spots if p % 2 == 0 else spots[::-1]):
-                    run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%s"
-                        % (self._touch_xy(x, y) + (off,)))
+                    run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z%.2f F900\n"
+                        "%s" % (self._touch_xy(x, y) + (zt, off)))
                     nz = self._touch(samples)
                     run("G0 Z5 F900%s" % (on,))
                     h = self.twist_reading(x, y, z)
@@ -3838,6 +3910,7 @@ class Lidar:
         if state in ("printing", "paused"):
             raise gcmd.error("LiDAR: not while a print is running")
         self._touch_ready(gcmd)
+        zt = self._touch_start_z()
         z = gcmd.get_float("Z", self.scan_z)
         try:
             cnt = [int(v) for v in gcmd.get("COUNT", "7,5").split(",")]
@@ -3883,14 +3956,15 @@ class Lidar:
         try:
             run("G90\nG0 Z5 F900")
             # the first nozzle tap after a wipe reads off: throw it away
-            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900" % self._touch_xy(*pts[0]))
+            run("G0 X%.2f Y%.2f F9000\nG0 Z%.2f F900" % (
+                self._touch_xy(*pts[0]) + (zt,)))
             self._touch(1)
             run("G0 Z5 F900")
             for p in range(passes):
                 for i, j in (order if p % 2 == 0 else order[::-1]):
                     x, y = xs[i], ys[j]
-                    run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z2 F900"
-                        % self._touch_xy(x, y))
+                    run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z%.2f F900"
+                        % (self._touch_xy(x, y) + (zt,)))
                     taps, nz = [], None
                     while nz is None:
                         if len(taps) >= max_taps:
@@ -4535,6 +4609,71 @@ class Lidar:
     # ------------------------------------------------------- PA test print
     desc_LIDAR_PA_CALIBRATE = "Print and measure a pressure advance test"
 
+    # -------------------------------------------- where test prints go
+    # The defaults are the K1 Max's; where they don't fit, the print is
+    # centred in the laser area. X=/Y= must fit, else nothing is started.
+    PA_PITCH = 3.0
+    PA_SEG_LENS = (15.0, 20.0, 15.0, 20.0, 15.0, 20.0, 15.0)
+    CROSS_HALF = 15.0
+
+    def _place(self, gcmd, default, centred, checks):
+        """(x, y) from X=/Y=, else default, else centred. checks(x, y) ->
+        [(segs, z)] for _check_reach (z None: nozzle coordinates)."""
+        x, y = gcmd.get_float("X", None), gcmd.get_float("Y", None)
+        if x is None and y is None:
+            class _G:
+                error = self.printer.command_error
+            try:
+                for segs, z in checks(*default):
+                    self._check_reach(_G(), segs, z)
+            except self.printer.command_error:
+                default = centred
+        pos = (default[0] if x is None else x, default[1] if y is None else y)
+        for segs, z in checks(*pos):
+            self._check_reach(gcmd, segs, z)
+        return pos
+
+    def _area_centre(self, gcmd, z):
+        x0, x1, y0, y1 = self._area_or_error(gcmd, z)
+        return (x0 + x1) / 2.0, (y0 + y1) / 2.0
+
+    def _pa_place(self, gcmd, lines):
+        """Front-left line start (x0, y0) of LIDAR_PA_CALIBRATE's lines."""
+        w = (lines - 1) * self.PA_PITCH
+        length = sum(self.PA_SEG_LENS)
+        cx, cy = self._area_centre(gcmd, self.scan_z)
+
+        def checks(x0, y0):
+            return [([(x0, y0, x0 + w, y0), (x0, y0 + length, x0 + w,
+                                              y0 + length)], None),
+                    ([(x0 + w / 2.0, y0 - 3.0, x0 + w / 2.0,
+                       y0 + length + 3.0)], self.scan_z)]
+        return self._place(gcmd, (130.0, 100.0),
+                           (round(cx - w / 2.0, 1), round(cy - length / 2.0,
+                                                          1)), checks)
+
+    def _creality_place(self, gcmd):
+        """Front-left corner of Creality's 27 x 139mm PA frame."""
+        cx, cy = self._area_centre(gcmd, self.scan_z)
+
+        def checks(ox, oy):
+            return [([(ox, oy, ox + 27.0, oy), (ox, oy + 139.0, ox + 27.0,
+                                                 oy + 139.0)], None)]
+        return self._place(gcmd, (170.0, 60.0),
+                           (round(cx - 13.5, 1), round(cy - 69.5, 1)), checks)
+
+    def _cross_place(self, gcmd, z1, z2):
+        """Centre of LIDAR_OFFSET_CALIBRATE's cross, scanned at Z1 and Z2."""
+        h = self.CROSS_HALF
+        centre = tuple(round(v, 1) for v in self._area_centre(gcmd, z2))
+
+        def checks(cx, cy):
+            return [([(cx, cy - h, cx, cy + h)], z) for z in (z1, z2)] + [
+                ([(cx - 10.0, cy, cx + 10.0, cy),
+                  (cx, cy - 10.0, cx, cy + 10.0),
+                  (cx, cy - h - 12.0, cx, cy - h - 12.0)], None)]
+        return self._place(gcmd, (150.0, 150.0), centre, checks)
+
     def cmd_LIDAR_PA_CALIBRATE(self, gcmd):
         temp = gcmd.get_float("EXTRUDER_TEMP", above=150.0)
         bed = gcmd.get_float("BED_TEMP", minval=0.0)
@@ -4542,18 +4681,17 @@ class Lidar:
         pa0 = gcmd.get_float("PA_START", 0.0, minval=0.0)
         pas = gcmd.get_float("PA_STEP", 0.01, above=0.0)
         lines = gcmd.get_int("LINES", 9, minval=4, maxval=9)
-        x0 = gcmd.get_float("X", 130.0)
-        y0 = gcmd.get_float("Y", 100.0)
+        x0, y0 = self._pa_place(gcmd, lines)
         fast = gcmd.get_float("FAST", 150.0, above=20.0)
         slow = gcmd.get_float("SLOW", 20.0, above=1.0)
         height = gcmd.get_float("HEIGHT", 0.2, above=0.05)
         width = gcmd.get_float("WIDTH", 0.45, above=0.1)
         accel = gcmd.get_float("ACCEL", 5000.0, above=100.0)
         fan = gcmd.get_int("FAN", 64, minval=0, maxval=255)
-        pitch = 3.0
+        pitch = self.PA_PITCH
         # slow / fast segments along Y; slow ones are long enough to settle
-        segs = [(15.0, slow), (20.0, fast), (15.0, slow), (20.0, fast),
-                (15.0, slow), (20.0, fast), (15.0, slow)]
+        segs = [(ln, slow if i % 2 == 0 else fast)
+                for i, ln in enumerate(self.PA_SEG_LENS)]
         y1 = y0 + sum(s[0] for s in segs)
         x1 = x0 + (lines - 1) * pitch
         cx = (x0 + x1) / 2.0
@@ -4648,8 +4786,7 @@ class Lidar:
         temp = gcmd.get_float("EXTRUDER_TEMP", above=150.0)
         bed = gcmd.get_float("BED_TEMP", minval=0.0)
         chamber = gcmd.get_float("CHAMBER_TEMP", 0.0, minval=0.0)
-        ox = gcmd.get_float("X", 170.0, minval=0.0, maxval=266.0)
-        oy = gcmd.get_float("Y", 60.0, minval=0.0, maxval=140.0)
+        ox, oy = self._creality_place(gcmd)
         pa0 = gcmd.get_float("PA_START", 0.02, minval=0.0)
         pas = gcmd.get_float("PA_STEP", 0.004, above=0.0)
         g, grid = creality_pa_gcode(ox, oy, pa0, pas)
@@ -4710,26 +4847,15 @@ class Lidar:
         temp = gcmd.get_float("EXTRUDER_TEMP", above=150.0)
         bed = gcmd.get_float("BED_TEMP", minval=0.0)
         chamber = gcmd.get_float("CHAMBER_TEMP", 0.0, minval=0.0)
-        cx = gcmd.get_float("X", 150.0)
-        cy = gcmd.get_float("Y", 150.0)
         z1 = gcmd.get_float("Z1", 3.0, minval=2.0, maxval=5.0)
         z2 = gcmd.get_float("Z2", 5.0, minval=2.0, maxval=6.0)
         apply = gcmd.get_int("APPLY", 1)
         if z2 - z1 < 1.0:
             raise gcmd.error("LiDAR: Z2 must be at least 1mm above Z1")
-        arm, lh, width, half = 10.0, 0.2, 0.6, 15.0
+        cx, cy = self._cross_place(gcmd, z1, z2)
+        arm, lh, width, half = 10.0, 0.2, 0.6, self.CROSS_HALF
         test = {"cx": cx, "cy": cy, "arm": arm, "height": 2 * lh}
         toolhead = self.printer.lookup_object("toolhead")
-        st = toolhead.get_status(self.reactor.monotonic())
-        lo, hi = st["axis_minimum"], st["axis_maximum"]
-        for z in (z1, z2):
-            nxs = [self._skewed([cx - self._xo(z), y - self._yo(z), z])[0]
-                   for y in (cy - half, cy + half)]
-            if not (lo[0] <= min(nxs) and max(nxs) <= hi[0]
-                    and lo[1] <= cy - half - self._yo(z)
-                    and cy + half - self._yo(z) <= hi[1]):
-                raise gcmd.error("LiDAR: the scans of a cross at X%.0f Y%.0f"
-                                 " would leave the bed" % (cx, cy))
         fil_area = getattr(toolhead.get_extruder(), "filament_area", 2.405)
         epm = lh * width / fil_area
         g = ["M83", "G90", "M106 S0"]

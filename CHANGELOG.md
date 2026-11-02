@@ -25,7 +25,9 @@ its settings are in its config, see **Upgrading** below.
 - `LIDAR_SETUP_CHECK`: driver, offsets, timing, service, reachable area and
   touch method, with what is missing.
 - `host/`: systemd unit, udev rule and installer for the driver on a Linux
-  Klipper host; `--helper` also installs the helper on the same host.
+  Klipper host; `--helper` also installs the helper on the same host
+  (`lidar-helper`, 127.0.0.1:7132; a K1's `k1-lidar` service on the same
+  computer is left alone).
 - `lidar_service.py --socket`: the helper talks to the driver's unix socket
   directly (no bridge) when both run on one host.
 - Printer configs: `config/generic.cfg` (every option), `config/ender3v3se.cfg`,
@@ -39,8 +41,19 @@ its settings are in its config, see **Upgrading** below.
   (`.../gcodes` and `.../lidar`); the K1 paths are the fallback.
 - `klipper/lidar.example.cfg` is printer-neutral; the K1's `[lidar]`,
   `LIDAR_DRIVER` and shell command moved to `k1max/lidar-k1max.cfg`.
-- `MESH_BENCHMARK`'s default area is the whole laser area (K1 Max: X5-270
-  Y5-265, was X20-265 Y25-265).
+- `MESH_BENCHMARK`'s default area is the laser area, narrowed to where the
+  probe reaches when `probe` is one of the methods (K1 Max: X5-270
+  Y18.8-265, was X20-265 Y25-265); it checks the touch method before the
+  first mesh.
+- The pressure advance, offset and Creality test prints keep the K1 Max
+  positions where they fit and are centred in the laser area elsewhere;
+  every position is checked against the travel before anything starts.
+- Probe touches start 2 mm above the probe's trigger height (load cells and
+  `gcode`: 2 mm above the bed, as before); probe-mode calibration lines stay
+  where the probe can reach.
+- Levels 4-5 extend the area on the side the laser line looks past (right
+  on a K1 Max, left when the laser sits right of the nozzle).
+- `LIDAR_SETUP_CHECK` also reports `zero_reference_position`.
 - Zero reference fallback: the laser area's centre (was the K1's 153, 173.3).
 
 ### Fixed

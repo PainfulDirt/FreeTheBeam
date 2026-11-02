@@ -66,7 +66,7 @@ def make_lidar(axis_min=(-2.0, -2.0), axis_max=(306.5, 306.0),
         objs["load_cell_probe"] = Obj(get_printer_probe=lambda: lc)
     if probe_offsets is not None:
         objs["probe"] = Obj(
-            get_offsets=lambda: (probe_offsets[0], probe_offsets[1], 1.0),
+            get_offsets=lambda: (tuple(probe_offsets) + (1.0,))[:3],
             get_status=lambda e: dict(probe_status))
 
     def run(script):
