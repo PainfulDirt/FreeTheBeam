@@ -1,17 +1,21 @@
-# Install: the helper service (optional)
+# Install: the helper service
 
-A second Linux computer (a Raspberry Pi 4 with 1 GB is plenty) runs the
-captures and the analysis so the printer's CPU and RAM stay free for Klipper.
-It only needs to be reachable over the network; only LiDAR data takes this
-path, Klipper stays on the printer.
+A second Linux computer (a Raspberry Pi 4 with 1 GB is plenty) does the
+captures and the analysis, so the printer's CPU and RAM stay free for
+Klipper. Only LiDAR data takes this path; Klipper stays on the printer.
 
-1. **On the printer**, start the bridge (it forwards TCP to the driver's socket,
-   only for one allowed IP): put the helper's IP in `k1max/helper-ip` and run
-   `k1max/lidar-start.sh`, or by hand:
+Optional for basic scans, **required** for bed meshes, the first-layer check,
+dwell scans, skew calibration and benchmarks. The service is standard-library
+Python 3 (no pip packages).
+
+1. **On the printer**, start the bridge (it forwards TCP :7130 to the
+   driver's socket, for one allowed IP only): put the helper's IP in
+   `k1max/helper-ip` and run `k1max/lidar-start.sh`, or by hand:
 
    ```
    python3 helper/lidar-bridge.py 7130 HELPER_IP
    ```
+
 2. **On the helper**, as root, from a checkout of this repo:
 
    ```
@@ -19,9 +23,24 @@ path, Klipper stays on the printer.
    ```
 
    It copies `klipper/lidar.py` and `helper/lidar_service.py` to
-   `/opt/k1-lidar/`, installs the `k1-lidar` systemd unit (listening on :7131,
-   data in `/var/lib/k1-lidar`, accepting only `PRINTER_IP`) and starts it.
-3. **In the printer config**, uncomment `service: HELPER_IP:7131` in `[lidar]`
-   and restart Klipper.
+   `/opt/k1-lidar/`, installs the `k1-lidar` systemd unit (listening on
+   :7131, data in `/var/lib/k1-lidar`, accepting only `PRINTER_IP`) and
+   starts it. Run it again after every update: the helper and the printer
+   must run the same `lidar.py`.
 
-Raw scans are kept on the helper as JSON in `/var/lib/k1-lidar`.
+3. **In the printer config**, set `service: HELPER_IP:7131` in `[lidar]` and
+   restart Klipper. `LIDAR_STATUS` then says "work done by the service".
+
+## What the helper keeps
+
+Everything is under `/var/lib/k1-lidar`:
+
+| Path | Contents |
+|---|---|
+| `<name>.json` | raw scans |
+| `meshes/`, `heightmap-*.json` | every LiDAR mesh, full-resolution height maps (level 4-5) |
+| `firstlayer/` | first-layer checks: `fl-<id>.json` + `.html`, `history.jsonl` |
+| `benchmarks/` | `MESH_BENCHMARK` runs, JSON + HTML |
+| `skew/` | `SKEW_SCAN` / `SKEW_CALIBRATE` data |
+
+Logs: `journalctl -u k1-lidar`.

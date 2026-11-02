@@ -1,8 +1,9 @@
 # How it works
 
-Short version: Creality put a perfectly good laser profiler on the toolhead,
-then wrapped it in a closed-source middleware that only runs inside Creality's
-own software stack. This repo talks to the module directly instead.
+Creality's LiDAR module is a laser line profiler on the toolhead. Stock, it
+is driven by a closed-source middleware that only runs inside Creality's own
+software stack. FreeTheBeam talks to the module directly and builds the
+printer features on top of that.
 
 ## The pieces
 
@@ -29,9 +30,11 @@ own software stack. This repo talks to the module directly instead.
    something else. It keeps one persistent connection per client and
    reinitialises the module if it is power-cycled.
 4. **`klipper/lidar.py`** is a Klipper/Kalico plugin: it moves the toolhead,
-   collects profiles, subtracts a bare-plate scan, and implements
-   `LIDAR_SCAN`, `LIDAR_TIMING`, `LIDAR_PA_CALIBRATE` and friends.
-5. **`helper/`** (optional) moves the heavy lifting off the printer.
+   collects profiles, subtracts a bare-plate scan, and implements scans, bed
+   meshes, the first-layer check and the calibrations
+   ([commands.md](commands.md)).
+5. **`helper/`** moves the heavy lifting off the printer (required for
+   meshes and the first-layer check).
 
 ## Frames and timing
 
@@ -56,8 +59,27 @@ slower stop-mode scan of the same strip within the noise (p05..p95 of the
 difference 18-31 µm).
 
 Textured PEI changes by ~76 µm between rows only 0.1 mm apart, which is why
-moving scans were dropped and why a bare-plate scan is subtracted from every
-measurement.
+scans that compare two states (PA test, first layer) stand still at exactly
+the same rows both times and subtract a bare-plate scan.
+
+## Moving scans (bed mesh)
+
+For bed meshes the toolhead does not stop: mesh levels 1-3 take frames while
+moving along columns at constant speed (60-150 mm/s). Each frame is placed
+with Klipper's trapq (the planned motion) over the frame's exposure window,
+and frames taken while accelerating are dropped. A mesh point averages the
+profile over a few mm (`HALF_X`), which smooths the plate's texture. Level 4
+scans strips with the whole 28 mm laser line; level 5 adds nozzle touches
+and fits the LiDAR mesh to them. Corrections for the X-beam twist and the
+error along Y, measured against the nozzle, are applied to every mesh. See
+[bed-mesh.md](bed-mesh.md).
+
+## First-layer check
+
+The bare plate under the objects is scanned before the purge; at layer 2 the
+print pauses and the same rows are scanned again. The difference, after
+removing the plate's drift between the scans (fitted on the bare parts), is
+the first layer's thickness map. See [first-layer.md](first-layer.md).
 
 ## Geometry (K1 Max, glass bed + textured PEI)
 

@@ -3,7 +3,8 @@
 # on /tmp/ai_server_uds (request = JSON + 0x03, reply the same), but drives
 # the LiDAR directly over its serial port with lidar_serial.py. lidar.py,
 # lidar-bridge.py and the helper service don't notice the difference.
-# Started by lidar-start.sh when variables.cfg has lidar_driver = 'direct'.
+# Started by lidar-start.sh unless variables.cfg has lidar_driver =
+# 'middleware'.
 #
 # Streaming: {"control": "get_point_cloud", "prefetch": 1} starts a thread
 # that keeps asking the module for frames back-to-back (its frame clock never
@@ -16,7 +17,7 @@
 # Creality's algorithms (flow / first floor / offset detection) and the
 # dangerous commands (sticker calibration, IR image) answer code 103.
 #
-#   lidar-direct.py [--socket PATH] [--port DEV]
+#   lidar-direct.py [--socket PATH] [--port DEV] [--version]
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import argparse
@@ -339,6 +340,8 @@ def parse_args(argv):
                     help="unix socket to serve (default: %(default)s)")
     ap.add_argument("--port", default=ls.PORT,
                     help="LiDAR serial device (default: %(default)s)")
+    ap.add_argument("--version", action="version",
+                    version="FreeTheBeam lidar-direct " + ls.__version__)
     return ap.parse_args(argv)
 
 

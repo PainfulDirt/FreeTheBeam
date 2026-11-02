@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Safety or security problem
+    url: https://github.com/PainfulDirt/FreeTheBeam/security/advisories/new
+    about: Anything that can brick the module or crash the toolhead; please report privately.

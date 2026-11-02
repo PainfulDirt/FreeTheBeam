@@ -1,0 +1,35 @@
+name: Test report from another printer
+description: Results (good or bad) from a machine other than the development printer
+labels: [test-report]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: FreeTheBeam version
+    validations:
+      required: true
+  - type: input
+    id: printer
+    attributes:
+      label: Printer, firmware stack, plate, LiDAR firmware
+    validations:
+      required: true
+  - type: checkboxes
+    id: features
+    attributes:
+      label: What you tried
+      options:
+        - label: Driver (lidar-direct.py)
+        - label: LIDAR_SCAN / LIDAR_TIMING
+        - label: Bed mesh (LIDAR_BED_MESH)
+        - label: Mesh calibration (twist / grid)
+        - label: First-layer check
+        - label: PA / offset / skew calibration
+        - label: K1 Max extras (keep-out, wipe, True Zero touch, twist touch)
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Numbers if you have them (MESH_BENCHMARK, MESH_COMPARE, first-layer check output)
+    validations:
+      required: true

@@ -8,10 +8,11 @@
 #
 # The stock udev hook (laser_status.sh) switches the LiDAR off right after it
 # enumerates unless /tmp/load_done exists, which the Creality stack would
-# create. Then a driver serves /tmp/ai_server_uds for lidar.py: Creality's
-# cx_ai_middleware (still ships on the printer) or lidar-direct.py, the open
-# replacement (same JSON API). variables.cfg: lidar_driver = 'direct' or
-# 'middleware' (default); switch with the LIDAR_DRIVER macro, which runs this.
+# create. Then a driver serves /tmp/ai_server_uds for lidar.py:
+# lidar-direct.py, the open driver (default), or Creality's cx_ai_middleware
+# (same JSON API, still ships on the printer) as a fallback.
+# variables.cfg: lidar_driver = 'direct' (or unset) or 'middleware'; switch
+# with the LIDAR_DRIVER macro, which runs this.
 touch /tmp/load_done
 [ -x /usr/bin/laser_power.sh ] || exit 0
 # fails harmlessly before the first enumeration (no laser_info.json yet); the
@@ -28,12 +29,12 @@ fi
 sleep 2
 C=$(dirname "$(readlink -f "$0")")
 DRIVER=$(sed -n "s/^lidar_driver = '\(.*\)'/\1/p" /usr/data/printer_data/config/variables.cfg)
-if [ "$DRIVER" = direct ]; then
+if [ "$DRIVER" != middleware ]; then
+    DRIVER=direct
     killall cx_ai_middleware > /dev/null 2>&1 && sleep 1
     pgrep -f lidar-direct.py > /dev/null ||
         setsid python3 -B $C/../driver/lidar-direct.py < /dev/null > /dev/null 2>&1 &
 else
-    DRIVER=middleware
     for p in $(pgrep -f lidar-direct.py); do kill $p; done
     if ! pidof cx_ai_middleware > /dev/null; then
         rm -f /tmp/ai_server_uds

@@ -1,0 +1,51 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Safety problems (a way to brick the module or crash the toolhead) go through
+        private vulnerability reporting instead, see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: FreeTheBeam version
+      description: From `LIDAR_STATUS` or `python3 driver/lidar-direct.py --version`
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: printer
+    attributes:
+      label: Printer and firmware stack
+      placeholder: "K1 Max, Simple AF + Kalico (version), LiDAR firmware 1.0.13"
+    validations:
+      required: true
+  - type: dropdown
+    id: helper
+    attributes:
+      label: Helper service
+      options:
+        - "yes (service: set in [lidar])"
+        - "no, everything on the printer"
+        - "driver only, no Klipper"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, with their parameters
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console output / logs
+      description: Klipper console, driver output, `journalctl -u k1-lidar` on the helper
+      render: text

@@ -12,5 +12,7 @@ mkdir -p /opt/k1-lidar /var/lib/k1-lidar
 cp "$R/klipper/lidar.py" "$R/helper/lidar_service.py" /opt/k1-lidar/
 sed "s/PRINTER_IP/$1/g" "$R/helper/k1-lidar.service" > /etc/systemd/system/k1-lidar.service
 systemctl daemon-reload
-systemctl enable --now k1-lidar
+systemctl enable k1-lidar
+# restart, so a re-install after an update runs the new code
+systemctl restart k1-lidar
 systemctl --no-pager status k1-lidar | head -5
