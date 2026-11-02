@@ -6,7 +6,8 @@
 # through lidar-bridge.py, reduces the point clouds, keeps the raw captures
 # on disk and runs the analysis. The K1 then only forwards bytes.
 #
-#   lidar_service.py --printer PRINTER_IP:7130 [--listen 0.0.0.0:7131]
+#   lidar_service.py --printer PRINTER_IP:7130 | --socket /tmp/ai_server_uds
+#                    [--listen 0.0.0.0:7131]
 #                    [--data /var/lib/k1-lidar] [--allow PRINTER_IP]
 #
 # Requests and replies are one JSON object per line.
@@ -28,7 +29,9 @@ NAN = float("nan")
 
 
 class Middleware:
-    """One persistent connection to cx_ai_middleware via lidar-bridge.py."""
+    """One persistent connection to the LiDAR driver: (host, port) of
+    lidar-bridge.py on the printer, or the driver's unix socket path when
+    it runs on this host."""
 
     def __init__(self, addr):
         self.addr = addr
@@ -46,7 +49,12 @@ class Middleware:
         err = None
         for attempt in range(2):
             try:
-                if self.sock is None:
+                if self.sock is None and isinstance(self.addr, str):
+                    self.sock = socket.socket(socket.AF_UNIX,
+                                              socket.SOCK_STREAM)
+                    self.sock.settimeout(5.0)
+                    self.sock.connect(self.addr)
+                elif self.sock is None:
                     self.sock = socket.create_connection(self.addr, 5.0)
                     self.sock.setsockopt(socket.IPPROTO_TCP,
                                          socket.TCP_NODELAY, 1)
@@ -62,7 +70,7 @@ class Middleware:
             except (OSError, ValueError) as e:
                 err = e
                 self.close()
-        raise RuntimeError("no answer from cx_ai_middleware (%s)" % (err,))
+        raise RuntimeError("no answer from the LiDAR driver (%s)" % (err,))
 
 
 class Service:
@@ -631,21 +639,33 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--printer", required=True,
-                    help="host:port of lidar-bridge.py on the printer")
+    drv = ap.add_mutually_exclusive_group(required=True)
+    drv.add_argument("--printer",
+                     help="host:port of lidar-bridge.py on the printer")
+    drv.add_argument("--socket",
+                     help="the driver's unix socket, when it runs on this"
+                          " host (e.g. /tmp/ai_server_uds)")
     ap.add_argument("--listen", default="0.0.0.0:7131")
     ap.add_argument("--data", default="/var/lib/k1-lidar")
     ap.add_argument("--allow", action="append", default=[])
-    a = ap.parse_args()
-    host, port = a.printer.rsplit(":", 1)
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
+    if a.socket:
+        addr = a.socket
+    else:
+        host, port = a.printer.rsplit(":", 1)
+        addr = (host, int(port))
     lhost, lport = a.listen.rsplit(":", 1)
     srv = Server((lhost, int(lport)), Handler)
-    srv.svc = Service(Middleware((host, int(port))), a.data)
+    srv.svc = Service(Middleware(addr), a.data)
     srv.allow = set(a.allow)
     print("k1-lidar service on %s, LiDAR via %s, data in %s" % (
-        a.listen, a.printer, a.data), flush=True)
+        a.listen, a.socket or a.printer, a.data), flush=True)
     srv.serve_forever()
 
 

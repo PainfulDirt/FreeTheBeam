@@ -1,0 +1,3 @@
+# Creality LiDAR module (CH343 USB serial, 1a86:55d3): the same name as on
+# the K1 (lidar-direct.py's default port), readable by the dialout group.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", SYMLINK+="serial/by-id/creality-laser", MODE="0660", GROUP="dialout"

@@ -1,0 +1,17 @@
+# FreeTheBeam: the open LiDAR driver on a Linux Klipper host (Pi, PC).
+# Installed by host/install.sh, which fills in KLIPPER_USER.
+[Unit]
+Description=FreeTheBeam LiDAR driver (lidar-direct.py)
+After=network.target
+
+[Service]
+User=KLIPPER_USER
+SupplementaryGroups=dialout
+# the socket must be visible to Klipper in the normal /tmp
+PrivateTmp=no
+ExecStart=/usr/bin/python3 -B /opt/freethebeam/driver/lidar-direct.py --socket /tmp/ai_server_uds
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
