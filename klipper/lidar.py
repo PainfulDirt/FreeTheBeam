@@ -23,6 +23,16 @@
 #   lidar_x_per_z, lidar_y_per_z (variables.cfg); they override these
 #   #service: HELPER_IP:7131   # optional: lidar_service.py on a helper
 #                              # computer does the captures and the analysis
+#   #mesh_min: 5, 5            # narrow where meshes and calibrations look
+#   #mesh_max: 270, 265        #   (default: what the laser reaches)
+#   #twist_y: 145              # LIDAR_TWIST_CALIBRATE lines (default: from
+#   #ytwist_x: 100, 200        #   the laser area)
+#   #touch: auto               # load_cell, probe, gcode or none (auto:
+#                              #   load_cell, else probe, else none)
+#   #touch_gcode: NOZZLE_TOUCH # touch: gcode, contact Z from the status
+#   #touch_result: nozzle_touch:last_touch_z   #   value object:key
+#   #touch_temp: 150           # nozzle temperature for touches
+#   #touch_wipe_gcode:         # run before a series of touches
 #
 # Commands:
 #   LIDAR_STATUS
@@ -1880,6 +1890,15 @@ class Lidar:
         # twist_y, AXIS=Y at laser X ytwist_x (defaults from the area)
         self.twist_y = config.getfloat("twist_y", None)
         self.ytwist_x = config.getfloatlist("ytwist_x", None)
+        # nozzle touches (calibrations, level 5, benchmarks), see
+        # _touch_mode; touch: auto picks load_cell, else probe, else none
+        touch = config.getchoice("touch", dict((m, m) for m in (
+            "auto",) + self.TOUCH_MODES), "auto")
+        self.touch = None if touch == "auto" else touch
+        self.touch_gcode = config.get("touch_gcode", "NOZZLE_TOUCH")
+        self.touch_result = config.get("touch_result", None)
+        self.touch_temp = config.getfloat("touch_temp", 150.0, minval=0.0)
+        self.touch_wipe_gcode = config.get("touch_wipe_gcode", None)
         # what made each mesh profile this session (MESH_COMPARE)
         self.mesh_info = {}
         # point cloud level for dwell scans: 0 all points (~0.02mm apart),
@@ -2631,6 +2650,100 @@ class Lidar:
             y0 - 1.0, y1 + 1.0, z, 0.3)[1]))
         return self._grid(x0, x1, nx), self._grid(y0, y1, ny)
 
+    # ------------------------------------------------------- nozzle touches
+    # load_cell: Kalico's [load_cell_probe] (the K1's load cells); probe:
+    # any [probe], moved so the probe is over the spot (the reference is
+    # then the probe, not the nozzle: less accurate); gcode: touch_gcode
+    # with the nozzle over the spot, contact Z read from the status
+    # "object:key" in touch_result; none: no touches
+    TOUCH_MODES = ("load_cell", "probe", "gcode", "none")
+    touch = touch_result = touch_wipe_gcode = None
+    touch_gcode = "NOZZLE_TOUCH"
+    touch_temp = 150.0
+
+    def _touch_mode(self):
+        if self.touch:
+            return self.touch
+        if self.printer.lookup_object("load_cell_probe", None) is not None:
+            return "load_cell"
+        if self.printer.lookup_object("probe", None) is not None:
+            return "probe"
+        return "none"
+
+    def _touch_error(self, msg):
+        return self.printer.command_error("LiDAR: " + msg)
+
+    def _touch_ready(self, gcmd):
+        """Refuse before anything moves if nozzle touches can't work."""
+        mode = self._touch_mode()
+        if mode == "none":
+            raise gcmd.error(
+                "LiDAR: this needs a touch method ([lidar] touch:):"
+                " load_cell, probe or gcode")
+        if mode == "load_cell" and self.printer.lookup_object(
+                "load_cell_probe", None) is None:
+            raise gcmd.error("LiDAR: touch: load_cell but no"
+                             " [load_cell_probe]")
+        if mode == "probe" and self.printer.lookup_object(
+                "probe", None) is None:
+            raise gcmd.error("LiDAR: touch: probe but no [probe]")
+        if mode == "gcode":
+            self._touch_result_object()
+
+    def _touch_result_object(self):
+        """(object, key) named by touch_result ("object:key")."""
+        name, _, key = (self.touch_result or "").rpartition(":")
+        obj = self.printer.lookup_object(name, None) if name else None
+        if obj is None or not key:
+            raise self._touch_error(
+                "touch: gcode needs touch_result: <object>:<key> naming a"
+                " status value that holds the contact Z (got %r)"
+                % (self.touch_result,))
+        return obj, key
+
+    def _touch_xy(self, x, y):
+        """Toolhead X/Y that puts the touching part over spot (x, y)."""
+        if self._touch_mode() == "probe":
+            off = self.printer.lookup_object("probe").get_offsets()
+            return x - off[0], y - off[1]
+        return x, y
+
+    def _touch(self, samples):
+        """Touch at the current position; the contact Z (median of
+        samples)."""
+        mode = self._touch_mode()
+        run = self.gcode.run_script_from_command
+        if mode == "load_cell":
+            run("LOAD_CELL_PROBE SAMPLES=%d SAMPLES_RESULT=median" % (
+                samples,))
+            return self.printer.lookup_object(
+                "load_cell_probe").get_printer_probe().last_z_result
+        if mode == "probe":
+            run("PROBE SAMPLES=%d SAMPLES_RESULT=median" % (samples,))
+            return self.printer.lookup_object("probe").get_status(
+                self.reactor.monotonic())["last_z_result"]
+        if mode == "gcode":
+            obj, key = self._touch_result_object()
+            zs = []
+            for i in range(samples):
+                run(self.touch_gcode)
+                v = obj.get_status(self.reactor.monotonic()).get(key)
+                if v is None:
+                    raise self._touch_error(
+                        "touch_result %r: no value after %s"
+                        % (self.touch_result, self.touch_gcode))
+                zs.append(float(v))
+            return median(zs)
+        raise self._touch_error("this needs a touch method ([lidar] touch:):"
+                                " load_cell, probe or gcode")
+
+    def _touch_heat(self, wait, wipe=True):
+        """Nozzle to touch_temp (M109 with wait), then touch_wipe_gcode."""
+        run = self.gcode.run_script_from_command
+        run("%s S%.0f" % ("M109" if wait else "M104", self.touch_temp))
+        if wait and wipe and self.touch_wipe_gcode:
+            run(self.touch_wipe_gcode)
+
     def _grid(self, a, b, n):
         return [round(a + (b - a) * i / (n - 1), 3) for i in range(n)]
 
@@ -3001,14 +3114,10 @@ class Lidar:
             raise gcmd.error("LiDAR: strips more than 28.5mm apart leave"
                              " gaps (the line is ~28mm wide)")
         self._check_reach(gcmd, [(x, y0, x, y1) for x in sxs], z)
-        tt = None
         if touch:
+            self._touch_ready(gcmd)
             # the nozzle heats for the touches while the LiDAR scans
-            tm = self.printer.lookup_object(
-                "gcode_macro _LOAD_CELL_TOUCH_Z", None)
-            tt = float(getattr(tm, "variables", {}).get("touch_temp", 150)
-                       if tm is not None else 150)
-            self.gcode.run_script_from_command("M104 S%.0f" % (tt,))
+            self._touch_heat(wait=False)
         for i, x in enumerate(sxs):
             name = "mesh_s%02d" % (i,)
             a, b = (y0, y1) if i % 2 == 0 else (y1, y0)
@@ -3024,10 +3133,7 @@ class Lidar:
             tx = self._grid(x0 + m, x1 - m, n)
             ty = self._grid(y0 + m, y1 - m, n)
             run = self.gcode.run_script_from_command
-            run("M109 S%.0f" % (tt,))
-            if o.get("wipe", 1) and self.printer.lookup_object(
-                    "gcode_macro _TOUCH_NOZZLE_WIPE", None) is not None:
-                run("_TOUCH_NOZZLE_WIPE")
+            self._touch_heat(wait=True, wipe=o.get("wipe", 1))
             spots = [(x, y) for i, x in enumerate(tx)
                      for y in (ty if i % 2 == 0 else ty[::-1])]
             touches = self.touch_grid(gcmd, spots, o.get("samples", 3),
@@ -3051,21 +3157,23 @@ class Lidar:
 
     def touch_grid(self, gcmd, spots, samples=3, bed_off=1, ref=None,
                    ref_every=6):
-        """Nozzle touches (load cells) at spots [(x, y)], nozzle coordinates,
+        """Nozzle touches (_touch) at spots [(x, y)], nozzle coordinates,
         bed mesh off. Every ref_every spots, and at the start and the end,
         the reference spot (zero_reference_position) once more: the drift
         in time between them comes off later (drift_fit). bed_off: the bed
         heater off just for each touch (its switching disturbs the load
         cells; a few seconds don't cool the bed). Returns [(x, y, z, time,
         is_ref)]."""
-        lcp = self.printer.lookup_object("load_cell_probe", None)
-        if lcp is None:
-            raise gcmd.error("LiDAR: no [load_cell_probe]")
-        lc = lcp.get_printer_probe()
+        self._touch_ready(gcmd)
         bm = self.printer.lookup_object("bed_mesh")
         if ref is None:
-            ref = list(bm.bmc.zero_ref_pos or (153.0, 173.3))
-        self._check_reach(gcmd, [(x, y, x, y) for x, y in spots + [ref]])
+            ref = bm.bmc.zero_ref_pos
+        if ref is None:
+            ax0, ax1, ay0, ay1 = self._laser_area(self.scan_z)
+            ref = (round((ax0 + ax1) / 2.0, 3), round((ay0 + ay1) / 2.0, 3))
+        ref = list(ref)
+        self._check_reach(gcmd, [self._touch_xy(x, y) * 2
+                                 for x, y in spots + [ref]])
         heater = self.printer.lookup_object("heater_bed", None)
         target = heater.get_status(self.reactor.monotonic())["target"] \
             if heater is not None else 0.0
@@ -3087,16 +3195,19 @@ class Lidar:
         try:
             run("G90\nG0 Z5 F900")
             # the first nozzle tap after a wipe reads off: throw it away
-            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%sLOAD_CELL_PROBE"
-                " SAMPLES=1\n%sG0 Z5 F900" % (ref[0], ref[1], off, on))
+            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%s" % (
+                self._touch_xy(*ref) + (off,)))
+            self._touch(1)
+            run("%sG0 Z5 F900" % (on,))
             for k, (x, y) in enumerate(order):
-                run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%s"
-                    "LOAD_CELL_PROBE SAMPLES=%d SAMPLES_RESULT=median\n%s"
-                    "G0 Z5 F900" % (x, y, off, samples, on))
-                out.append((x, y, lc.last_z_result, self.reactor.monotonic(),
+                run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%s" % (
+                    self._touch_xy(x, y) + (off,)))
+                nz = self._touch(samples)
+                run("%sG0 Z5 F900" % (on,))
+                out.append((x, y, nz, self.reactor.monotonic(),
                             (x, y) == tuple(ref)))
                 gcmd.respond_info("  touch %d/%d X%.1f Y%.1f: z %.4f" % (
-                    k + 1, len(order), x, y, lc.last_z_result))
+                    k + 1, len(order), x, y, nz))
         finally:
             if on:
                 run(on)
@@ -3521,10 +3632,7 @@ class Lidar:
             self.reactor.monotonic())["state"]
         if state in ("printing", "paused"):
             raise gcmd.error("LiDAR: not while a print is running")
-        lcp = self.printer.lookup_object("load_cell_probe", None)
-        if lcp is None:
-            raise gcmd.error("LiDAR: no [load_cell_probe]")
-        lc = lcp.get_printer_probe()
+        self._touch_ready(gcmd)
         z = gcmd.get_float("Z", self.scan_z)
         axis = gcmd.get("AXIS", "X").upper()
         if axis not in ("X", "Y"):
@@ -3550,7 +3658,7 @@ class Lidar:
         # the nozzle touches at (x, y), the laser looks at y-1..y+1
         self._check_reach(gcmd, [(x, y - 1.0, x, y + 1.0) for x, y in spots],
                           z)
-        self._check_reach(gcmd, [(x, y, x, y) for x, y in spots])
+        self._check_reach(gcmd, [self._touch_xy(x, y) * 2 for x, y in spots])
         bm = self.printer.lookup_object("bed_mesh")
         old_mesh = bm.get_mesh()
         gcode_move = self.printer.lookup_object("gcode_move")
@@ -3569,14 +3677,16 @@ class Lidar:
         try:
             run("G90\nG0 Z5 F900")
             # the first nozzle tap after a wipe reads off: throw it away
-            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900\nLOAD_CELL_PROBE SAMPLES=1"
-                "\nG0 Z5 F900" % spots[0])
+            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900" % self._touch_xy(
+                *spots[0]))
+            self._touch(1)
+            run("G0 Z5 F900")
             for p in range(passes):
                 for x, y in (spots if p % 2 == 0 else spots[::-1]):
                     run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z2 F900\n%s"
-                        "LOAD_CELL_PROBE SAMPLES=%d SAMPLES_RESULT=median\n"
-                        "G0 Z5 F900%s" % (x, y, off, samples, on))
-                    nz = lc.last_z_result
+                        % (self._touch_xy(x, y) + (off,)))
+                    nz = self._touch(samples)
+                    run("G0 Z5 F900%s" % (on,))
                     h = self.twist_reading(x, y, z)
                     diffs[(x, y)].append((self.reactor.monotonic(), h - nz))
                     # LiDAR distance with the nozzle tip on the surface
@@ -3638,10 +3748,7 @@ class Lidar:
             self.reactor.monotonic())["state"]
         if state in ("printing", "paused"):
             raise gcmd.error("LiDAR: not while a print is running")
-        lcp = self.printer.lookup_object("load_cell_probe", None)
-        if lcp is None:
-            raise gcmd.error("LiDAR: no [load_cell_probe]")
-        lc = lcp.get_printer_probe()
+        self._touch_ready(gcmd)
         z = gcmd.get_float("Z", self.scan_z)
         try:
             cnt = [int(v) for v in gcmd.get("COUNT", "7,5").split(",")]
@@ -3662,7 +3769,7 @@ class Lidar:
                  for i in (range(nx) if j % 2 == 0 else range(nx - 1, -1, -1))]
         pts = [(xs[i], ys[j]) for i, j in order]
         self._check_reach(gcmd, [(x, y - 1.0, x, y + 1.0) for x, y in pts], z)
-        self._check_reach(gcmd, [(x, y, x, y) for x, y in pts])
+        self._check_reach(gcmd, [self._touch_xy(x, y) * 2 for x, y in pts])
         heater = self.printer.lookup_object("heater_bed", None)
         target = heater.get_status(self.reactor.monotonic()).get(
             "target", 0.0) if heater is not None else 0.0
@@ -3687,13 +3794,14 @@ class Lidar:
         try:
             run("G90\nG0 Z5 F900")
             # the first nozzle tap after a wipe reads off: throw it away
-            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900\nLOAD_CELL_PROBE SAMPLES=1"
-                "\nG0 Z5 F900" % pts[0])
+            run("G0 X%.2f Y%.2f F9000\nG0 Z2 F900" % self._touch_xy(*pts[0]))
+            self._touch(1)
+            run("G0 Z5 F900")
             for p in range(passes):
                 for i, j in (order if p % 2 == 0 else order[::-1]):
                     x, y = xs[i], ys[j]
                     run("G0 Z5 F900\nG0 X%.2f Y%.2f F9000\nG0 Z2 F900"
-                        % (x, y))
+                        % self._touch_xy(x, y))
                     taps, nz = [], None
                     while nz is None:
                         if len(taps) >= max_taps:
@@ -3705,8 +3813,11 @@ class Lidar:
                                     ", ".join("%.4f" % t for t in taps)))
                         if taps:
                             run("G91\nG0 Z1 F600\nG90")
-                        run("%sLOAD_CELL_PROBE SAMPLES=1%s" % (off, on))
-                        taps.append(lc.last_z_result)
+                        if off:
+                            run(off)
+                        taps.append(self._touch(1))
+                        if on:
+                            run(on)
                         nz = agreeing_value(taps, MIN_AGREEING_TAPS, tol)
                     retaps += len(taps) - MIN_AGREEING_TAPS
                     run("G0 Z5 F900")

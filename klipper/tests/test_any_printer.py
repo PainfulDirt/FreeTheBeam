@@ -58,5 +58,88 @@ class TestGeometry(unittest.TestCase):
         self.assertEqual(xs, [64.8, 129.2])
 
 
+class TestTouch(unittest.TestCase):
+    def test_auto_mode(self):
+        self.assertEqual(make_lidar(load_cell=True, **SMALL)[0]._touch_mode(),
+                         "load_cell")
+        self.assertEqual(make_lidar(probe_offsets=(0.0, 20.3),
+                                    **SMALL)[0]._touch_mode(), "probe")
+        self.assertEqual(make_lidar(**SMALL)[0]._touch_mode(), "none")
+        self.assertEqual(make_lidar(load_cell=True, touch="probe",
+                                    probe_offsets=(0.0, 0.0),
+                                    **SMALL)[0]._touch_mode(), "probe")
+
+    def test_none_refuses_before_moving(self):
+        L, log, objs = make_lidar(**SMALL)
+        for cmd in (L.cmd_LIDAR_TWIST_CALIBRATE, L.cmd_LIDAR_GRID_CALIBRATE):
+            with self.assertRaises(Err) as cm:
+                cmd(Gcmd())
+            self.assertIn("needs a touch method ([lidar] touch:)",
+                          str(cm.exception))
+        self.assertEqual(log, [])
+
+    def test_probe_touch_moves_probe_over_spot(self):
+        L, log, objs = make_lidar(probe_offsets=(0.0, 20.3), **SMALL)
+        out = L.touch_grid(Gcmd(), [(100.0, 100.0)], 1, 0, ref=(110.0, 110.0))
+        self.assertIn("G0 X100.00 Y79.70 F9000", log)
+        self.assertIn("PROBE SAMPLES=1 SAMPLES_RESULT=median", log)
+        self.assertNotIn("LOAD_CELL_PROBE SAMPLES=1", log)
+        self.assertEqual([p[:3] for p in out if not p[4]],
+                         [(100.0, 100.0, 0.0)])
+
+    def test_probe_touch_out_of_travel_refused(self):
+        L, log, objs = make_lidar(probe_offsets=(0.0, 20.3), **SMALL)
+        with self.assertRaises(Err) as cm:
+            L.touch_grid(Gcmd(), [(100.0, 5.0)], 1, 0, ref=(110.0, 110.0))
+        self.assertIn("outside its travel", str(cm.exception))
+        self.assertEqual(log, [])
+
+    def _nozzle_touch(self, values):
+        vals = list(values)
+
+        def on_gcode(line, objs):
+            if line.startswith("NOZZLE_TOUCH"):
+                objs["nozzle_touch"].status["last_touch_z"] = vals.pop(0)
+        return on_gcode
+
+    def test_gcode_touch_reads_result(self):
+        L, log, objs = make_lidar(
+            touch="gcode", touch_result="nozzle_touch:last_touch_z",
+            on_gcode=self._nozzle_touch([0.010, 0.012, 0.011]), **SMALL)
+        nt = objs["nozzle_touch"] = type("NT", (), {})()
+        nt.status = {}
+        nt.get_status = lambda e: dict(nt.status)
+        self.assertAlmostEqual(L._touch(3), 0.011)
+        self.assertEqual([x for x in log if x == "NOZZLE_TOUCH"],
+                         ["NOZZLE_TOUCH"] * 3)
+
+    def test_gcode_touch_missing_result(self):
+        for result in ("nozzle_touch:nope", "nothing:last_touch_z", None):
+            L, log, objs = make_lidar(
+                touch="gcode", touch_result=result,
+                on_gcode=self._nozzle_touch([0.01]), **SMALL)
+            nt = objs["nozzle_touch"] = type("NT", (), {})()
+            nt.status = {}
+            nt.get_status = lambda e: dict(nt.status)
+            with self.assertRaises(Err) as cm:
+                L._touch_ready(Gcmd())
+                L._touch(1)
+            self.assertIn("touch_result", str(cm.exception))
+
+    def test_zero_ref_fallback_centre(self):
+        L, log, objs = make_lidar(load_cell=True, **SMALL)
+        L.touch_grid(Gcmd(), [(100.0, 100.0)], 1, 0)
+        self.assertEqual([x for x in log if x.startswith("G0 X")][0],
+                         "G0 X97.00 Y101.90 F9000")
+
+    def test_touch_temp_and_wipe(self):
+        L, log, objs = make_lidar(load_cell=True, touch_temp=170.0,
+                                  touch_wipe_gcode="MY_WIPE", **SMALL)
+        L._touch_heat(wait=False)
+        L._touch_heat(wait=True)
+        self.assertEqual(log, ["M104 S170", "M109 S170", "MY_WIPE"])
+        self.assertNotIn("gcode_macro _LOAD_CELL_TOUCH_Z", objs["_looked_up"])
+
+
 if __name__ == "__main__":
     unittest.main()
