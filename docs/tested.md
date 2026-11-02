@@ -57,7 +57,11 @@ normal prints since then.
 
 ## Not tested
 
-- Any other printer, LiDAR firmware or firmware stack.
+- Any other printer, LiDAR firmware or firmware stack. Since 0.3.0 the code
+  supports other Klipper printers ([install-other-printer.md](install-other-printer.md)),
+  and the K1 Max still behaves the same (offline regression tests), but no
+  other machine has run it yet. The `probe` and `gcode` touch methods and the
+  `host/` install are tested offline only.
 - Running without the helper service beyond basic scans.
 - The connector pinout ([pinout.md](pinout.md)).
 - 2.5 Mbaud on the serial link (needs a setting stored in the module's flash).

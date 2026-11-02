@@ -203,5 +203,39 @@ class TestSetupCheck(unittest.TestCase):
                           "/usr/data/printer_data/gcodes"))
 
 
+class TestMainline(unittest.TestCase):
+    def test_trapq_horizon_with_top_level_chelper(self):
+        """Mainline Klipper has chelper as a top-level module (klippy/ is on
+        sys.path), Kalico as klippy.chelper: both must work."""
+        import types
+        L, log, objs = make_lidar(**SMALL)
+
+        class Move:
+            print_time, move_t = 10.0, 0.5
+
+        class Lib:
+            def trapq_extract_old(self, tq, data, n, t0, t1):
+                data[0] = Move()
+                return 1
+
+        class Ffi:
+            def new(self, what):
+                return [None]
+        fake = types.ModuleType("chelper")
+        fake.get_ffi = lambda: (Ffi(), Lib())
+        saved = dict((k, sys.modules.get(k)) for k in ("chelper", "klippy"))
+        sys.modules["chelper"] = fake
+        sys.modules.pop("klippy", None)
+        try:
+            self.assertEqual(L._trapq_horizon(types.SimpleNamespace(
+                trapq=None)), 10.5)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+
 if __name__ == "__main__":
     unittest.main()

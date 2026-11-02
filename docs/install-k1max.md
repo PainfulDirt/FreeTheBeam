@@ -40,9 +40,16 @@ script). It:
 
 ## 4. Config
 
-Paste what you need from `klipper/lidar.example.cfg` into your printer config
-and adjust the path in `[gcode_shell_command k1_lidar_start]`. You need a
-`[save_variables]` section. Then hook the LiDAR into your print macros
+Add `k1max/lidar-k1max.cfg` (the K1's `[lidar]` with its bed limits,
+calibration lines and load-cell touch, and the `LIDAR_DRIVER` macro; adjust
+the path in `[gcode_shell_command k1_lidar_start]`) and what you need from
+`klipper/lidar.example.cfg` (macros) to your printer config. You need a
+`[save_variables]` section.
+
+> Upgrading from 0.2.0: the K1 values moved out of the code into
+> `lidar-k1max.cfg`. Without `mesh_min`/`mesh_max`, `twist_y`/`ytwist_x` and
+> `touch_wipe_gcode`, meshes would use the whole travel (into the keep-out
+> zones at the back) and calibrations other lines. Then hook the LiDAR into your print macros
 (Simple AF names in brackets):
 
 | Where | Add | For |
@@ -64,7 +71,7 @@ Only add the lines for the features you use. `LIDAR_PA_CALIBRATION` needs
    switching driver).
 3. `LIDAR_OFFSET_CALIBRATION`: prints a small cross and saves where the laser
    looks. Repeat after any change of plate or mount.
-4. With the helper and load cells: `LIDAR_MESH_CALIBRATION` (clear plate,
+4. With the helper and load cells: `LIDAR_SETUP_CHECK`, then `LIDAR_MESH_CALIBRATION` (clear plate,
    bed at print temperature), then `LIDAR_MESH` to try a mesh and
    `MESH_COMPARE A=lidar B=<your probe profile>` to compare it. Switch on
    `LiDAR_Mesh` once you trust it.

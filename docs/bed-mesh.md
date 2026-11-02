@@ -22,9 +22,11 @@ meshes the printed objects only (+5 mm), always including the
 `zero_reference_position`: the LiDAR measures distance, not absolute height,
 so the mesh is made 0 where Z was homed or touched.
 
-Reach on a K1 Max: X 5-269 x Y 5-265 (to X 283 with levels 4-5). The laser
-looks 36 mm left of and 21 mm in front of the nozzle, so the right ~30 mm and
-the back ~35 mm are out of view. With `FALLBACK=1` (the START_PRINT hook
+The LiDAR can only look where the nozzle can take it: the area is the travel
+shifted by the laser offset, narrowed by `mesh_min`/`mesh_max`
+(`LIDAR_SETUP_CHECK` prints it). On a K1 Max: X 5-270 x Y 5-265 (to X 284
+with levels 4-5); the laser looks 36 mm left of and 21 mm in front of the
+nozzle, so the right ~30 mm and the back ~35 mm are out of view. With `FALLBACK=1` (the START_PRINT hook
 uses it) anything the LiDAR can't do (objects out of reach, service down, a
 failed scan) falls back to `BED_MESH_CALIBRATE` and the print goes on.
 
@@ -33,8 +35,9 @@ Every mesh is also kept on the helper (`meshes/`, `heightmap-*.json`).
 ## Calibration
 
 The LiDAR sits in front of the nozzle, so anything that tips the toolhead
-reads as height. Two corrections are measured against the nozzle itself
-(load-cell touches) and applied to every LiDAR mesh:
+reads as height. Two corrections are measured against touches (the nozzle
+itself with load cells, or your touch method) and applied to every LiDAR
+mesh:
 
 - **X-beam twist** (`lidar_twist`): the gantry tips the toolhead forwards or
   backwards by an amount that changes along X. On the development printer:
@@ -100,8 +103,10 @@ calibration after hardware changes.
 ## Limitations
 
 - Needs the helper service; the printer alone is too slow for it.
-- Needs load cells (`[load_cell_probe]`) for the calibrations and level 5.
-  Without them levels 1-4 still run, but without twist/Y correction.
+- Needs a touch method (`touch:` in `[lidar]`) for the calibrations and
+  level 5. Load cells touch with the nozzle itself; a probe works but is
+  less accurate (it has its own twist). Without one, levels 1-4 still run,
+  but without twist/Y correction.
 - Not absolute: Z=0 comes from homing / your nozzle touch.
 - Textured PEI scatters ±13-20 µm per spot between what the nozzle touches
   and what the laser sees. That is why only smooth curves are fitted, never

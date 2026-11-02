@@ -6,7 +6,7 @@
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 
 **Open-source driver and Klipper/Kalico integration for the Creality K1 Max
-"AI LiDAR".** *Free the beam. Own your first layer.*
+"AI LiDAR", on the K1 Max or mounted on any Klipper printer.** *Free the beam. Own your first layer.*
 
 The K1 Max has a laser line profiler on its toolhead with micrometre
 repeatability. Stock, it is driven by a closed-source middleware that only
@@ -51,12 +51,13 @@ and LiDAR-measured calibrations.
 |---|---|
 | Creality K1 Max, Simple AF (Pellcorp) + Kalico | developed and tested here: [what was tested](docs/tested.md) |
 | LiDAR module firmware 1.0.13 | tested |
-| Other K1-series printers with the same module, other firmware stacks | untested; reports welcome |
+| Any Cartesian/CoreXY Klipper or Kalico printer with the module mounted | supported, untested: [install-other-printer](docs/install-other-printer.md); reports welcome |
 | The module on any Linux machine (driver only) | should work (standard-library Python 3.8+) |
 
-Bed mesh calibration, level 5 and benchmarks need load cells
-(`[load_cell_probe]`). Meshes, the first-layer check and dwell scans need the
-helper service.
+Meshes, the first-layer check and dwell scans need the helper service (on a
+second computer or on the Klipper host itself). Mesh calibration, level 5
+and benchmarks need a way to touch the bed: load cells, a probe, or your own
+nozzle-touch command. `LIDAR_SETUP_CHECK` shows what your setup can do.
 
 ## Installation
 
@@ -64,6 +65,7 @@ helper service.
 |---|---|---|
 | Read profiles from the module on any Linux machine | `driver/` | [install-generic](docs/install-generic.md) |
 | Use the LiDAR on a K1 Max with Simple AF + Kalico | `driver/`, `klipper/`, `k1max/` | [install-k1max](docs/install-k1max.md) |
+| Mount the module on another Klipper printer | `host/`, `driver/`, `klipper/`, `config/` | [install-other-printer](docs/install-other-printer.md) |
 | Keep-out zones, nozzle wipe, True Zero touch, probe twist | `klipper/*.py`, `k1max/k1max-extras.cfg` | [install-k1max](docs/install-k1max.md#6-k1-max-extras-optional) |
 | Bed meshes, first-layer check, analysis | add `helper/` | [install-helper](docs/install-helper.md) |
 

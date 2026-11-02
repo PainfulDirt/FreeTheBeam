@@ -2,17 +2,19 @@
 
 Commands registered by `klipper/lidar.py`. The authoritative, complete
 parameter list is the comment block at the top of that file; this page is
-the overview. Defaults are for a K1 Max.
+the overview. Numbers in the descriptions are a K1 Max's; the defaults
+are in the options table below.
 
 **Needs** column: *service* = the helper service (`service:` in `[lidar]`,
-see [install-helper.md](install-helper.md)); *load cells* = a
-`[load_cell_probe]` for nozzle touches; *homed* = `G28` first.
+see [install-helper.md](install-helper.md)); *touch* = a touch method
+(`touch:` in `[lidar]`, below); *homed* = `G28` first.
 
 ## Status and timing
 
 | Command | What it does | Needs |
 |---|---|---|
 | `LIDAR_STATUS` | Checks that the driver answers; prints the version, offsets, where the work runs and the scans in memory. | |
+| `LIDAR_SETUP_CHECK` | What this printer's setup can do: driver, offsets measured or not, timing, service, the area the LiDAR reaches, the touch method, skew/keep-out; ends with what is missing. | |
 | `LIDAR_TIMING [Z=3] [DZ=1.5] [SPEED=5] [CYCLES=15] [LEVELS=0,1] [APPLY=1]` | Measures the frame period and the time window a frame covers (slow Z moves over a flat plate) and saves them as `lidar_timing` for dwell scans. Run once per driver. | service, homed |
 
 ## Scanning
@@ -27,11 +29,11 @@ See [bed-mesh.md](bed-mesh.md).
 
 | Command | What it does | Needs |
 |---|---|---|
-| `LIDAR_BED_MESH [LEVEL=1-5 \| MODE=quick\|fast\|normal\|fine\|ultimate] [ADAPTIVE=0] [PROFILE=lidar] [FALLBACK=0]` | Bed mesh with the LiDAR. Levels 1-3 sample along columns while moving (or standing, `MOTION=dwell`), 4 scans strips with the whole laser line, 5 adds a 5x5 grid of nozzle touches. `ADAPTIVE=1` meshes only the printed objects. `FALLBACK=1` runs `BED_MESH_CALIBRATE` instead of failing. | service, homed; load cells for level 5 |
-| `LIDAR_TWIST_CALIBRATE [AXIS=X\|Y] [POINTS=] [PASSES=2] [APPLY=1]` | The LiDAR against nozzle touches on a line: `AXIS=X` the X-beam twist (`lidar_twist`), `AXIS=Y` the error along Y (`lidar_ytwist`). | service, homed, load cells |
-| `LIDAR_GRID_CALIBRATE [COUNT=7,5] [PASSES=2] [TOLERANCE=0.010] [APPLY=1]` | Nozzle taps (3 agreeing) and the LiDAR on every grid point; X curve and Y curve saved, the rest reported (`lidar_grid`). Method after [Axis Twist Mesh](https://github.com/sterling5241/axis-mesh). | service, homed, load cells |
+| `LIDAR_BED_MESH [LEVEL=1-5 \| MODE=quick\|fast\|normal\|fine\|ultimate] [ADAPTIVE=0] [PROFILE=lidar] [FALLBACK=0]` | Bed mesh with the LiDAR. Levels 1-3 sample along columns while moving (or standing, `MOTION=dwell`), 4 scans strips with the whole laser line, 5 adds a 5x5 grid of nozzle touches. `ADAPTIVE=1` meshes only the printed objects. `FALLBACK=1` runs `BED_MESH_CALIBRATE` instead of failing. | service, homed; touch for level 5 |
+| `LIDAR_TWIST_CALIBRATE [AXIS=X\|Y] [POINTS=] [PASSES=2] [APPLY=1]` | The LiDAR against nozzle touches on a line: `AXIS=X` the X-beam twist (`lidar_twist`), `AXIS=Y` the error along Y (`lidar_ytwist`). | service, homed, touch |
+| `LIDAR_GRID_CALIBRATE [COUNT=7,5] [PASSES=2] [TOLERANCE=0.010] [APPLY=1]` | Nozzle taps (3 agreeing) and the LiDAR on every grid point; X curve and Y curve saved, the rest reported (`lidar_grid`). Method after [Axis Twist Mesh](https://github.com/sterling5241/axis-mesh). | service, homed, touch |
 | `MESH_COMPARE A=<profile> [B=<profile>\|active] [STEP=10]` | A - B over the overlap: offset, plane, rms/max, worst points, provenance of each profile. | |
-| `MESH_BENCHMARK [METHODS=probe,1,2,3,4,5,repeat2] [TRUTH=6]` | Runs several mesh methods on one area and judges them against a TRUTH x TRUTH grid of nozzle touches; JSON + HTML report on the helper. | service, homed, load cells |
+| `MESH_BENCHMARK [METHODS=probe,1,2,3,4,5,repeat2] [TRUTH=6]` | Runs several mesh methods on one area and judges them against a TRUTH x TRUTH grid of nozzle touches; JSON + HTML report on the helper. | service, homed, touch |
 
 ## First layer
 
@@ -76,6 +78,25 @@ From `klipper/keep_out.py`, `klipper/nozzle_wipe.py`, `klipper/twist_touch.py`
 | `LIDAR_PA_CALIBRATION`, `LIDAR_OFFSET_CALIBRATION`, `CREALITY_PA_TEST` | the calibration prints with default temperatures |
 | `_LIDAR_SWITCHES` (+ restore/save delayed G-code) | keeps the switches across restarts, restores `lidar_pa` at boot |
 | `_LIDAR_PRINT_START`, `_LIDAR_START_PRINT_MESH`, `_LIDAR_PRINT_SCAN`, `_FIRST_LAYER_OFFSET`, `_FIRST_LAYER_AFTER`, `_LIDAR_PRINT_END`, `_LIDAR_PRINT_CANCEL` | hooks for your START_PRINT, layer change, END_PRINT and CANCEL_PRINT |
+
+## `[lidar]` options
+
+Full list with comments: [`config/generic.cfg`](../config/generic.cfg).
+
+| Option | Default | What |
+|---|---|---|
+| `x_offset`, `y_offset`, `offset_z`, `x_per_z`, `y_per_z` | -36, -21.2, 3, 0, 0 | where the laser line centre is relative to the nozzle (`LIDAR_OFFSET_CALIBRATE` saves measured values, which win) |
+| `x_dir` | -1 | the profile runs towards printer -X (-1) or +X (1) |
+| `scan_z` | 3 | nozzle height for scans |
+| `service` | none | `host:port` of the helper service |
+| `mesh_min`, `mesh_max` | none | narrow the laser area (default: what the laser reaches within the travel) |
+| `twist_y`, `ytwist_x` | area Y centre; 1/3 and 2/3 of its X | `LIDAR_TWIST_CALIBRATE` lines |
+| `mesh_max_count` | 30 | most mesh points per axis |
+| `touch` | auto | `load_cell`, `probe`, `gcode` or `none`; auto: load_cell, else probe, else none |
+| `touch_gcode`, `touch_result` | `NOZZLE_TOUCH`, none | `touch: gcode`: the command, and the status value `object:key` with the contact Z |
+| `touch_temp`, `touch_wipe_gcode` | 150, none | nozzle temperature for touches; cleaning command before them |
+| `data_dir`, `gcode_dir` | next to `[virtual_sdcard] path` | where scans and generated test prints go |
+| `dwell_settle`, `dwell_margin` | 0.05, 0.015 | dwell scan timing (K1 Max: 0.03, 0.01) |
 
 ## Saved variables (`variables.cfg`)
 

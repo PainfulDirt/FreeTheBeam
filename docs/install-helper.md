@@ -4,6 +4,12 @@ A second Linux computer (a Raspberry Pi 4 with 1 GB is plenty) does the
 captures and the analysis, so the printer's CPU and RAM stay free for
 Klipper. Only LiDAR data takes this path; Klipper stays on the printer.
 
+When Klipper itself runs on a normal Linux host with the module on its USB
+(not a K1), the helper runs on that same host instead:
+`sh host/install.sh <klipper user> --helper` and `service: 127.0.0.1:7131`
+([install-other-printer.md](install-other-printer.md)). The steps below are
+for a K1 with a separate helper.
+
 Optional for basic scans, **required** for bed meshes, the first-layer check,
 dwell scans, skew calibration and benchmarks. The service is standard-library
 Python 3 (no pip packages).

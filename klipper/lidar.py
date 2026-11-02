@@ -3456,7 +3456,10 @@ class Lidar:
         f = getattr(trapq, "history_end", None)
         if f is not None:       # the offline simulator
             return f()
-        from klippy import chelper
+        try:
+            from klippy import chelper      # Kalico
+        except ImportError:
+            import chelper                  # mainline: klippy/ on sys.path
         ffi_main, ffi_lib = chelper.get_ffi()
         data = ffi_main.new("struct pull_move[1]")
         if not ffi_lib.trapq_extract_old(trapq.trapq, data, 1, 0.0, 1e30):
