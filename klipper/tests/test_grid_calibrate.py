@@ -121,6 +121,8 @@ def main():
     L.x_offset, L.y_offset, L.offset_z = -36.013, -21.336, 3.0
     L.x_per_z, L.y_per_z = 0.0354, -0.986
     L.twist_reading = twist_reading
+    # the K1 Max's [lidar] mesh_min / mesh_max
+    L.mesh_min, L.mesh_max = (5.0, 5.0), (270.0, 265.0)
 
     print("LIDAR_GRID_CALIBRATE COUNT=7,5:")
     L.cmd_LIDAR_GRID_CALIBRATE(Gcmd(count="7,5"))

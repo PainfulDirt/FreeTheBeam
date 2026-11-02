@@ -56,15 +56,16 @@
 #       20 PA values), run directly: no file in gcodes, nothing in the job
 #       list. X/Y = front-left corner of the 27 x 139mm frame. Not scanned
 #       or analysed yet: read it by eye (sharpest corners)
-#   LIDAR_GRID_CALIBRATE [COUNT=7,5] [X0=10] [X1=269] [Y0=6] [Y1=264]
+#   LIDAR_GRID_CALIBRATE [COUNT=7,5] [X0= X1= Y0= Y1=] (default: the laser
+#       area, _laser_area; K1 Max X10-269 Y6-264)
 #       [PASSES=2] [TOLERANCE=0.010] [MAX_TAPS=7] [MAX_SPREAD=0.04] [APPLY=1]
 #       the LiDAR against nozzle taps (3 agreeing) on a grid, the laser on
 #       the same spot before moving on; X curve -> lidar_twist, Y curve ->
 #       lidar_ytwist, the rest reported and kept as data (lidar_grid). After
 #       Axis Twist Mesh (github.com/sterling5241/axis-mesh, with permission)
-#   LIDAR_TWIST_CALIBRATE [AXIS=X] [Y=145] [X0=5] [X1=270] [POINTS=7]
+#   LIDAR_TWIST_CALIBRATE [AXIS=X] [Y=twist_y] [X0= X1=] [POINTS=7]
 #       [PASSES=2] [SAMPLES=3] [MAX_SPREAD=0.04] [APPLY=1]
-#       AXIS=Y [X=100,200] [POINTS=9] [Y0=6] [Y1=264]: the same along Y,
+#       AXIS=Y [X=ytwist_x] [POINTS=9] [Y0= Y1=]: the same along Y,
 #       saved as lidar_ytwist, a straight line (LiDAR meshes were tilted
 #       ~8-15 um/100mm along Y against the nozzle and the probe; each
 #       spot's texture scatters +-20 um, so only the slope is kept, with
@@ -1869,6 +1870,16 @@ class Lidar:
         # later than LIDAR_TIMING says shows as a Y shift between the two
         # directions (LIDAR_BED_MESH ... BOTH_WAYS=1 measures it)
         self.moving_lag = config.getfloat("moving_lag", 0.0)
+        # where meshes and calibrations look (laser coordinates): the
+        # travel shifted by the laser offset (_laser_area), narrowed by
+        # these if set (K1 Max: 5,5 / 270,265, its keep-out zones end Y)
+        self.mesh_min = config.getfloatlist("mesh_min", None, count=2)
+        self.mesh_max = config.getfloatlist("mesh_max", None, count=2)
+        self.mesh_max_count = config.getint("mesh_max_count", 30, minval=4)
+        # calibration lines: LIDAR_TWIST_CALIBRATE AXIS=X at laser Y
+        # twist_y, AXIS=Y at laser X ytwist_x (defaults from the area)
+        self.twist_y = config.getfloat("twist_y", None)
+        self.ytwist_x = config.getfloatlist("ytwist_x", None)
         # what made each mesh profile this session (MESH_COMPARE)
         self.mesh_info = {}
         # point cloud level for dwell scans: 0 all points (~0.02mm apart),
@@ -2539,12 +2550,86 @@ class Lidar:
                 driver, res))
 
     # ------------------------------------------------------------- bed mesh
-    # Where the laser can look (laser X/Y, = mesh coordinates): X up to the
-    # nozzle's X max + x_offset (306.5 - 36), Y up to where the nozzle
-    # (laser Y + 21.3) meets the keep-out zones at the back (Y287)
-    MESH_X = (5.0, 270.0)
-    MESH_Y = (5.0, 265.0)
-    MESH_MAX_COUNT = 30   # 30x30: ~0.5s to build in Klipper on the K1
+    # [lidar] options; class defaults too, for objects built without
+    # __init__ (tests)
+    mesh_min = mesh_max = twist_y = ytwist_x = None
+    mesh_max_count = 30   # 30x30: ~0.5s to build in Klipper on the K1
+
+    def _laser_area(self, z):
+        """Where the laser can look with the nozzle at height z (laser X/Y
+        = mesh coordinates): the part of the travel the nozzle also covers
+        shifted by the laser offset, 0.5mm inside, never below 0, narrowed
+        by mesh_min/mesh_max. (x0, x1, y0, y1); empty if x1 <= x0 or
+        y1 <= y0. Skew and keep-out zones are checked per move
+        (_reach_x, _check_reach)."""
+        st = self.printer.lookup_object("toolhead").get_status(
+            self.reactor.monotonic())
+        lo, hi = st["axis_minimum"], st["axis_maximum"]
+        off = (self._xo(z), self._yo(z))
+        area = []
+        for i in (0, 1):
+            a = max(max(lo[i], lo[i] + off[i]) + 0.5, 0.0)
+            b = min(hi[i], hi[i] + off[i]) - 0.5
+            if self.mesh_min is not None:
+                a = max(a, self.mesh_min[i])
+            if self.mesh_max is not None:
+                b = min(b, self.mesh_max[i])
+            area += [round(a, 3), round(b, 3)]
+        return tuple(area)
+
+    def _area_or_error(self, gcmd, z):
+        x0, x1, y0, y1 = area = self._laser_area(z)
+        if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+            raise gcmd.error(
+                "LiDAR: the LiDAR reaches no part of the bed (laser area"
+                " X%.1f-%.1f Y%.1f-%.1f at Z%.1f): check x_offset/y_offset"
+                " and mesh_min/mesh_max in [lidar]" % (x0, x1, y0, y1, z))
+        return area
+
+    def _twist_spots(self, gcmd, axis, z):
+        """LIDAR_TWIST_CALIBRATE's spots (laser = nozzle touch coordinates):
+        AXIS=X a line along X at twist_y (default: the area's Y centre),
+        AXIS=Y lines along Y at ytwist_x (default: 1/3 and 2/3 of the
+        area's X)."""
+        ax0, ax1, ay0, ay1 = self._area_or_error(gcmd, z)
+        if axis == "X":
+            n = gcmd.get_int("POINTS", 7, minval=3, maxval=15)
+            y = gcmd.get_float("Y", self.twist_y if self.twist_y is not None
+                               else round((ay0 + ay1) / 2.0, 1))
+            x0 = gcmd.get_float("X0", ax0)
+            x1 = gcmd.get_float("X1", min(ax1, self._reach_x(
+                y - 1.0, y + 1.0, z, 0.3)[1]))
+            return [(x, y) for x in self._grid(x0, x1, n)]
+        # the Y error is small (~10 um/100mm) next to the texture under
+        # each spot (+-20 um between a nozzle touch and the laser's view of
+        # the same spot, the same in every pass): only many spots help, so
+        # two lines and a straight-line fit
+        lx = self.ytwist_x or [round(ax0 + (ax1 - ax0) * f, 1)
+                               for f in (1.0 / 3.0, 2.0 / 3.0)]
+        if gcmd.get("X", None) is not None:
+            try:
+                lx = [float(v) for v in gcmd.get("X").split(",")]
+            except ValueError:
+                raise gcmd.error("LiDAR: X is one value or a list (X=100,200)")
+        n = gcmd.get_int("POINTS", 9, minval=3, maxval=15)
+        y0 = gcmd.get_float("Y0", ay0 + 1.0)
+        y1 = gcmd.get_float("Y1", ay1 - 1.0)
+        spots = []
+        for i, x in enumerate(lx):
+            ys = self._grid(y0, y1, n)
+            spots += [(x, y) for y in (ys if i % 2 == 0 else ys[::-1])]
+        return spots
+
+    def _grid_axes(self, gcmd, z, nx, ny):
+        """LIDAR_GRID_CALIBRATE's columns and rows: the area, 5mm in from
+        its left edge and 1mm in along Y."""
+        ax0, ax1, ay0, ay1 = self._area_or_error(gcmd, z)
+        y0 = gcmd.get_float("Y0", ay0 + 1.0)
+        y1 = gcmd.get_float("Y1", ay1 - 1.0)
+        x0 = gcmd.get_float("X0", ax0 + 5.0)
+        x1 = gcmd.get_float("X1", min(ax1, self._reach_x(
+            y0 - 1.0, y1 + 1.0, z, 0.3)[1]))
+        return self._grid(x0, x1, nx), self._grid(y0, y1, ny)
 
     def _grid(self, a, b, n):
         return [round(a + (b - a) * i / (n - 1), 3) for i in range(n)]
@@ -2725,8 +2810,9 @@ class Lidar:
         """Mesh area (laser = mesh coordinates): given, the printed objects
         (ADAPTIVE=1, like the probe's adaptive mesh) or all the LiDAR
         reaches."""
-        x0, x1 = (4.0, 284.0) if fine else self.MESH_X
-        y0, y1 = self.MESH_Y
+        ax0, ax1, y0, y1 = self._area_or_error(gcmd, o["z"])
+        # strips (fine) look 14mm either side of their centre line
+        x0, x1 = (ax0 - 1.0, ax1 + 14.0) if fine else (ax0, ax1)
         # strips (fine) reach 14mm past their centre line
         rx0, rx1 = self._reach_x(y0, y1, o["z"], 0.3)
         w = 14.0 if fine else 0.0
@@ -2767,19 +2853,19 @@ class Lidar:
         if x1 - x0 < 20.0 or y1 - y0 < 20.0:
             # bicubic needs 4 points a side; keep at least 20mm
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            x0, x1 = max(cx - 10.0, 4.0 if fine else self.MESH_X[0]), \
+            x0, x1 = max(cx - 10.0, ax0 - 1.0 if fine else ax0), \
                 max(cx + 10.0, x0 + 20.0)
             y0, y1 = cy - 10.0, cy + 10.0
         return x0, x1, y0, y1
 
     def _counts(self, o, n, x0, x1, y0, y1, full_x, full_y):
         # the level's spacing over the whole bed, fewer points on a smaller
-        # area (4 to MESH_MAX_COUNT)
+        # area (4 to mesh_max_count)
         def cnt(size, full):
             return max(4, min(n, int(round(size / (full / (n - 1)))) + 1))
         nx = o.get("count_x", cnt(x1 - x0, full_x))
         ny = o.get("count_y", cnt(y1 - y0, full_y))
-        m = self.MESH_MAX_COUNT
+        m = self.mesh_max_count
         return min(max(nx, 4), m), min(max(ny, 4), m)
 
     def _mesh(self, gcmd, o):
@@ -2793,8 +2879,9 @@ class Lidar:
         dwell = o["motion"] == "dwell"
         if not fine and dwell:
             n = dn
+        ax0, ax1, ay0, ay1 = self._laser_area(z)
         nx, ny = self._counts(o, n, x0, x1, y0, y1,
-                              280.0 if fine else 265.0, 260.0)
+                              ax1 - ax0 + (15.0 if fine else 0.0), ay1 - ay0)
         xs, ys = self._grid(x0, x1, nx), self._grid(y0, y1, ny)
         twist, yt, tnote = self._lidar_tables() if o["twist"] else (
             None, None, "")
@@ -2903,7 +2990,7 @@ class Lidar:
         # strips that use the whole laser line (+-14mm), side by side,
         # covering the mesh area
         x0, x1, y0, y1 = xs[0], xs[-1], ys[0], ys[-1]
-        rx1 = min(self.MESH_X[1], self._reach_x(y0, y1, z, 0.3)[1])
+        rx1 = min(self._laser_area(z)[1], self._reach_x(y0, y1, z, 0.3)[1])
         sx0 = o.get("strip_x0", max(x0 + 13.5, min(18.0, rx1)))
         sx1 = o.get("strip_x1", min(max(x1 - 13.5, sx0), rx1))
         ns = o.get("strips", max(1, int(math.ceil((sx1 - sx0) / 28.0)) + 1))
@@ -3266,10 +3353,11 @@ class Lidar:
             raise gcmd.error("MESH_BENCHMARK needs the lidar service")
         methods = [m.strip().lower() for m in gcmd.get(
             "METHODS", "probe,1,2,3,4,5,repeat2").split(",") if m.strip()]
-        area = {"x0": gcmd.get_float("X0", 20.0),
-                "x1": gcmd.get_float("X1", 265.0),
-                "y0": gcmd.get_float("Y0", 25.0),
-                "y1": gcmd.get_float("Y1", 265.0)}
+        ax0, ax1, ay0, ay1 = self._area_or_error(gcmd, self.scan_z)
+        area = {"x0": gcmd.get_float("X0", ax0),
+                "x1": gcmd.get_float("X1", ax1),
+                "y0": gcmd.get_float("Y0", ay0),
+                "y1": gcmd.get_float("Y1", ay1)}
         nt = gcmd.get_int("TRUTH", 6, minval=0, maxval=10)
         bm = self.printer.lookup_object("bed_mesh")
         atc = self.printer.lookup_object("axis_twist_compensation", None)
@@ -3441,29 +3529,7 @@ class Lidar:
         axis = gcmd.get("AXIS", "X").upper()
         if axis not in ("X", "Y"):
             raise gcmd.error("LiDAR: AXIS is X or Y")
-        n = gcmd.get_int("POINTS", 7, minval=3, maxval=15)
-        if axis == "X":
-            y = gcmd.get_float("Y", 145.0)
-            x0 = gcmd.get_float("X0", self.MESH_X[0])
-            x1 = gcmd.get_float("X1", min(self.MESH_X[1], self._reach_x(
-                y - 1.0, y + 1.0, z, 0.3)[1]))
-            spots = [(x, y) for x in self._grid(x0, x1, n)]
-        else:
-            # the Y error is small (~10 um/100mm) next to the texture under
-            # each spot (+-20 um between a nozzle touch and the laser's
-            # view of the same spot, the same in every pass): only many
-            # spots help, so two lines and a straight-line fit
-            try:
-                lx = [float(v) for v in gcmd.get("X", "100,200").split(",")]
-            except ValueError:
-                raise gcmd.error("LiDAR: X is one value or a list (X=100,200)")
-            n = gcmd.get_int("POINTS", 9, minval=3, maxval=15)
-            y0 = gcmd.get_float("Y0", self.MESH_Y[0] + 1.0)
-            y1 = gcmd.get_float("Y1", self.MESH_Y[1] - 1.0)
-            spots = []
-            for i, x in enumerate(lx):
-                ys = self._grid(y0, y1, n)
-                spots += [(x, y) for y in (ys if i % 2 == 0 else ys[::-1])]
+        spots = self._twist_spots(gcmd, axis, z)
         # the coordinate along the measured axis
         k = 0 if axis == "X" else 1
         passes = gcmd.get_int("PASSES", 2, minval=1, maxval=4)
@@ -3584,17 +3650,13 @@ class Lidar:
         nx, ny = (cnt * 2)[:2]
         if not (3 <= nx <= 15 and 3 <= ny <= 15):
             raise gcmd.error("LiDAR: COUNT 3-15 per axis")
-        y0 = gcmd.get_float("Y0", self.MESH_Y[0] + 1.0)
-        y1 = gcmd.get_float("Y1", self.MESH_Y[1] - 1.0)
-        x0 = gcmd.get_float("X0", 10.0)
-        x1 = gcmd.get_float("X1", min(self.MESH_X[1], self._reach_x(
-            y0 - 1.0, y1 + 1.0, z, 0.3)[1]))
+        xs, ys = self._grid_axes(gcmd, z, nx, ny)
+        x0, x1, y0, y1 = xs[0], xs[-1], ys[0], ys[-1]
         passes = gcmd.get_int("PASSES", 2, minval=1, maxval=4)
         tol = gcmd.get_float("TOLERANCE", 0.010, above=0.0)
         max_taps = gcmd.get_int("MAX_TAPS", 7, minval=MIN_AGREEING_TAPS)
         max_spread = gcmd.get_float("MAX_SPREAD", 0.04, above=0.0)
         apply = gcmd.get_int("APPLY", 1)
-        xs, ys = self._grid(x0, x1, nx), self._grid(y0, y1, ny)
         # serpentine by rows
         order = [(i, j) for j in range(ny)
                  for i in (range(nx) if j % 2 == 0 else range(nx - 1, -1, -1))]
@@ -3861,8 +3923,9 @@ class Lidar:
             raise gcmd.error("FIRST_LAYER_SCAN: home first")
         xo, yo = self._xo(z), self._yo(z)
         ly0 = st["axis_minimum"][1] + yo + 0.5
-        rx0, rx1 = self._reach_x(ly0, self.MESH_Y[1], z)
-        lo, hi = (rx0, ly0), (rx1, self.MESH_Y[1])
+        ay1 = self._laser_area(z)[3]
+        rx0, rx1 = self._reach_x(ly0, ay1, z)
+        lo, hi = (rx0, ly0), (rx1, ay1)
         plan = fl_plan([o["polygon"] for o in objs],
                        gcmd.get_float("MARGIN", 8.0, minval=4.0),
                        lo, hi, gcmd.get_float("STEP", 2.0, minval=0.5),
@@ -4113,8 +4176,9 @@ class Lidar:
         z = gcmd.get_float("Z", self.scan_z + height, minval=self.scan_z)
         xo, yo = self._xo(z), self._yo(z)
         ly0 = st["axis_minimum"][1] + yo + 0.5
-        rx0, rx1 = self._reach_x(ly0, self.MESH_Y[1], z)
-        lo, hi = (rx0, ly0), (rx1, self.MESH_Y[1])
+        ay1 = self._laser_area(z)[3]
+        rx0, rx1 = self._reach_x(ly0, ay1, z)
+        lo, hi = (rx0, ly0), (rx1, ay1)
         plan = skew_plan(box, gcmd.get_float("MARGIN", 10.0, minval=4.0),
                          lo, hi, gcmd.get_float("STEP", 1.0, minval=0.2,
                                                 maxval=2.0))
