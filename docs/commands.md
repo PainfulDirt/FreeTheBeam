@@ -53,7 +53,7 @@ See [first-layer.md](first-layer.md).
 | `LIDAR_PA_FLOW_STEP STEP=BARE\|PHOTOS\|ANALYZE` | Internal steps of that print (only inside `lidar_pa_flow_test.gcode`). | |
 | `LIDAR_PA_ANALYZE BASE= SCAN= [APPLY=1]` | Analyses a PA test scan against its bare-plate scan. | |
 | `LIDAR_PA_CREALITY EXTRUDER_TEMP= BED_TEMP= [X=170] [Y=60]` | Prints Creality's PA pattern (20 values), read by eye. | |
-| `LIDAR_OFFSET_CALIBRATE EXTRUDER_TEMP= BED_TEMP= [X=150] [Y=150] [Z1=3] [Z2=5] [APPLY=1]` | Prints a small cross and measures where the laser looks (X/Y offset and its change per mm of Z). With the helper and the camera: a 1-layer cross photographed and scanned at both heights, saved from the camera only when camera and LiDAR agree within 0.15 mm. Saved in `variables.cfg`, overrides `[lidar]`. | |
+| `LIDAR_OFFSET_CALIBRATE EXTRUDER_TEMP= BED_TEMP= [X=150] [Y=150] [Z1=3] [Z2=5] [APPLY=1]` | Prints a small cross and measures where the laser looks (X/Y offset and its change per mm of Z). With the helper and the camera: a 1-layer cross photographed and scanned at both heights, saved from the camera when camera and LiDAR agree within 0.15 mm, or, when the LiDAR can't see the thin cross, when the camera is within 1 mm of the current offsets. Saved in `variables.cfg`, overrides `[lidar]`. | |
 | `SKEW_SCAN NAME= ROT= [X0= Y0= X1= Y1=]` | Scans a printed square; scan it twice, turned ~90° between the scans. | service, homed |
 | `SKEW_CALIBRATE NAMES=a,b [APPLY=1]` | XY skew from two `SKEW_SCAN`s, without calipers; `APPLY=1` sets it via `[skew_correction]`. | service |
 

@@ -287,7 +287,7 @@ class GenericTests(unittest.TestCase):
 
 
 class OffsetTests(unittest.TestCase):
-    def run_offset(self, cam_x):
+    def run_offset(self, cam_x, lidar_ok=True):
         L = make()
         L.x_offset, L.y_offset, L.x_per_z, L.y_per_z = -36.0, -21.3, 0.03, -0.98
         L.offset_z, L.offset_source = 3.0, "test"
@@ -309,9 +309,12 @@ class OffsetTests(unittest.TestCase):
         old = lidar.offset_solve
         lidar.offset_solve = lambda fits, test, ref_z: {
             "ok": True, "x_offset": -36.0, "y_offset": -21.3, "x_per_z": 0.03,
-            "y_per_z": -0.98, "report": ["lidar"]}
+            "y_per_z": -0.98, "report": ["lidar"]} if lidar_ok else {
+            "ok": False, "reason": "Z3.0: cross not found", "report": []}
         try:
-            L.cmd_LIDAR_OFFSET_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
+            g = Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60)
+            L.gcmd_info = g.info
+            L.cmd_LIDAR_OFFSET_CALIBRATE(g)
         finally:
             lidar.offset_solve = old
         return L
@@ -321,6 +324,19 @@ class OffsetTests(unittest.TestCase):
             L = self.run_offset(-36.30)
         # nothing saved: run again to inspect the events
         L = make()
+
+    def test_offset_lidar_blind_saves_camera_within_1mm(self):
+        # thin white 1-layer cross: the LiDAR can't see it, the camera can
+        L = self.run_offset(-36.53, lidar_ok=False)
+        sv = [e[1] for e in L.ev if e[0] == "gcode" and "SAVE_VARIABLE" in e[1]]
+        self.assertIn("SAVE_VARIABLE VARIABLE=lidar_x_offset VALUE=-36.5300", sv)
+        info = [e[1] for e in L.ev if e[0] == "info"]
+        self.assertTrue(any("camera only, the LiDAR couldn't see the cross"
+                            in m for m in info + L.gcmd_info), info)
+
+    def test_offset_lidar_blind_camera_far_not_saved(self):
+        with self.assertRaises(Err):
+            self.run_offset(-37.2, lidar_ok=False)
 
     def test_offset_agreement_saves_camera(self):
         L = self.run_offset(-36.05)

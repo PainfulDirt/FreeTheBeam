@@ -33,8 +33,15 @@ exposure that follows the plate. Camera background and results:
     `last_filament_name`). Without a saved flow the hook sets M221 S100.
 - **`LIDAR_OFFSET_CALIBRATE` with the camera**: a 1-layer cross (arms ±7 mm)
   photographed (fill light + laser line at the same pose) and scanned at Z1
-  and Z2; the camera's offsets are saved only when camera and LiDAR agree
-  within 0.15 mm.
+  and Z2. The camera must find the cross. When the LiDAR's cross fit works,
+  the camera's offsets are saved only if camera and LiDAR agree within 0.15
+  mm; when it fails (a thin white 1-layer cross is nearly invisible to the
+  LiDAR: the laser light spreads inside the plastic), the camera result is
+  saved alone if it is within 1 mm (X and Y) of the current offsets, else
+  refused. The console says which ("camera only, the LiDAR couldn't see
+  the cross" / "LiDAR within X.. Y.."). On the K1 Max the camera put the X
+  offset 0.53 mm from the old LiDAR value; the LiDAR's own point cloud of a
+  printed line confirmed ~0.5 mm (camera mapping and LiDAR within 0.09 mm).
 - **Camera webcam**: `lidar-direct.py --camera-port N` serves `/` and
   `/snapshot`, only while the camera switch is on (`--camera-switch`,
   default the new `LiDAR_Camera` output pin, `none` = always) and the LiDAR

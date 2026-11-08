@@ -134,10 +134,20 @@ A 1-layer cross (0.2 mm, arms ±7 mm: taller steps confuse the module's line
 finder, the line ends are dim on dark plates) is printed; at Z1 and Z2 the
 camera takes a fill-light picture of the cross and a laser picture at the
 same pose, and the helper finds where the profile's x = 0 lies on the laser
-line relative to the cross. The LiDAR scans the cross too. The camera's
-offsets are saved only when camera and LiDAR agree within 0.15 mm.
-The LiDAR fit of the 1-layer cross accepts a cross that reads low (thin
-white lines: ~0.08 of 0.2 mm).
+line relative to the cross. The LiDAR scans the cross too. Saving:
+
+- the camera must find the cross, else nothing is saved;
+- if the LiDAR's cross fit works, camera and LiDAR must agree within 0.15 mm
+  (console: "LiDAR within X.. Y..");
+- if the LiDAR fit fails (a thin white 1-layer cross is nearly invisible to
+  it: the laser light spreads inside the plastic), the camera result is
+  saved alone when it is within 1 mm (X and Y) of the current offsets, else
+  refused (console: "camera only, the LiDAR couldn't see the cross").
+
+The LiDAR fit of the 1-layer cross accepts a cross that reads low (~0.08 of
+0.2 mm). On the K1 Max the camera put the X offset 0.53 mm from the old
+LiDAR-measured value; the LiDAR's own point cloud of a printed line
+confirmed the same ~0.5 mm (camera mapping and LiDAR within 0.09 mm).
 
 ## Known limitations (0.4.0)
 

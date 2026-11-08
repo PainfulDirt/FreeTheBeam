@@ -89,8 +89,9 @@
 #       and Z2 and works out where the laser looks: X/Y offset and how far
 #       it moves per mm of height. Run directly, nothing in the job list.
 #       With the helper and the camera: a 1-layer cross, photographed at
-#       both heights too, saved from the camera only when camera and LiDAR
-#       agree within 0.15 mm
+#       both heights too, saved from the camera when camera and LiDAR agree
+#       within 0.15 mm, or (the LiDAR can't see a thin white cross) when the
+#       camera stays within 1 mm of the current offsets
 #   LIDAR_PA_CREALITY EXTRUDER_TEMP= BED_TEMP= [X=170] [Y=60]
 #       [PA_START=0.02] [PA_STEP=0.004]
 #       Creality's own PA test pattern (frame, flow boxes, four zig-zags,
@@ -5551,8 +5552,10 @@ class Lidar:
         at by the LiDAR's camera at Z1 and Z2 (fill-light picture of the
         cross + laser picture, same pose; the helper finds where the profile's
         x = 0 on the laser line lies) and scanned by the LiDAR as a check
-        (the helper finds the cross).
-        Saved only when camera and LiDAR agree within 0.15 mm."""
+        (the helper finds the cross). Saved when camera and LiDAR agree
+        within 0.15 mm; when the LiDAR fit fails (a thin white 1-layer cross
+        is nearly invisible to it) the camera alone, within 1 mm of the
+        current offsets."""
         state = self.printer.lookup_object("print_stats").get_status(
             self.reactor.monotonic())["state"]
         if state in ("printing", "paused"):
@@ -5633,15 +5636,28 @@ class Lidar:
             pass
         for line in (cam.get("report") or []) + (lid.get("report") or []):
             gcmd.respond_info(line)
-        if not cam.get("ok_cam", cam.get("ok")) or not lid.get("ok"):
+        if not cam.get("ok_cam", cam.get("ok")):
             raise gcmd.error("LiDAR offset: not saved (camera: %s, LiDAR: %s)"
-                             % (cam.get("reason") or "ok",
-                                lid.get("reason") or "ok"))
-        dx = abs(cam["x_offset"] - lid["x_offset"])
-        dy = abs(cam["y_offset"] - lid["y_offset"])
-        if dx > 0.15 or dy > 0.15:
-            raise gcmd.error("LiDAR offset: camera and LiDAR disagree by X%.2f"
-                             " Y%.2f mm, not saved" % (dx, dy))
+                             % (cam.get("reason"), lid.get("reason") or "ok"))
+        if lid.get("ok"):
+            dx = abs(cam["x_offset"] - lid["x_offset"])
+            dy = abs(cam["y_offset"] - lid["y_offset"])
+            if dx > 0.15 or dy > 0.15:
+                raise gcmd.error("LiDAR offset: camera and LiDAR disagree by"
+                                 " X%.2f Y%.2f mm, not saved" % (dx, dy))
+            check = "LiDAR within X%.2f Y%.2f" % (dx, dy)
+        else:
+            # a thin white 1-layer cross is nearly invisible to the LiDAR
+            # (the laser light spreads inside the plastic): the camera alone,
+            # if it stays within 1 mm of the current offsets
+            dx = abs(cam["x_offset"] - self.x_offset)
+            dy = abs(cam["y_offset"] - self.y_offset)
+            if dx > 1.0 or dy > 1.0:
+                raise gcmd.error(
+                    "LiDAR offset: the LiDAR couldn't check it (%s) and the"
+                    " camera is X%.2f Y%.2f mm from the current offsets, not"
+                    " saved" % (lid.get("reason"), dx, dy))
+            check = "camera only, the LiDAR couldn't see the cross"
         new = (cam["x_offset"], cam["y_offset"], cam["x_per_z"],
                cam["y_per_z"])
         if abs(new[0] - self.x_offset) > 5 or abs(new[1] - self.y_offset) > 5:
@@ -5655,9 +5671,10 @@ class Lidar:
                 "SAVE_VARIABLE VARIABLE=%s VALUE=%.4f" % (var, v))
         self.offset_source = "saved by LIDAR_OFFSET_CALIBRATE (camera)"
         gcmd.respond_info("LiDAR offset saved: X%.2f Y%.2f at Z%.1f, per mm"
-                          " Z X%+.3f Y%+.3f (camera; LiDAR within X%.2f Y%.2f)"
-                          % (new[0], new[1], self.offset_z, new[2], new[3],
-                             dx, dy))
+                          " Z X%+.3f Y%+.3f (%s)" % (
+                              new[0], new[1], self.offset_z, new[2], new[3],
+                              check))
+
 
 def creality_pa_gcode(ox, oy, pa0, pas):
     """Creality's PA test pattern, from Auto_pressure_advance_testpadvance.gcode

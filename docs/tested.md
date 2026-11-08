@@ -29,7 +29,7 @@ normal prints since then.
 | Feature | Tested | Result |
 |---|---|---|
 | `LIDAR_OFFSET_CALIBRATION` (LiDAR, 2-layer cross) | 2026-10-06 | Laser line at nozzle X -36 / Y -21.2 (Creality's stock value: -23.2 in Y) |
-| `LIDAR_OFFSET_CALIBRATION` with the camera (1-layer cross) | 2026-11-08: the cross is found in real photos at both heights (offline test on them); a full saved run not yet | camera vs LiDAR agreement check (0.15 mm) tested offline |
+| `LIDAR_OFFSET_CALIBRATION` with the camera (1-layer cross) | 2026-11-08 | The camera found the cross at both heights and put the X offset 0.53 mm from the old LiDAR value; the LiDAR's point cloud of a printed line confirmed ~0.5 mm (camera mapping and LiDAR within 0.09 mm). The LiDAR's own fit of the thin white cross failed, hence the camera-only rule (within 1 mm of the current offsets); the saving rules are tested offline |
 | `LIDAR_PA_CALIBRATION` (LiDAR) | by 2026-10-07 | PA 0.0431 for a PETG; on thin white PLA on black PEI the LiDAR reads the lines low and PA scattered (0.0475 / 0.0302) |
 | `LIDAR_PA_FLOW_CALIBRATION` (camera), PA | 2026-11-08, white matte PLA on black smooth PEI | **PA 0.0361** (r² 0.90), saved and in use |
 | `LIDAR_PA_FLOW_CALIBRATION` (camera), flow | 2026-11-08 | 0.921 -> M221 S108.6, but a printed A/B check (pads at 100 / 104.3 / 108.6 %) looked best at 104 %: **~4 % low**, so flow is experimental and only saved with `FLOW_SAVE=1` |
