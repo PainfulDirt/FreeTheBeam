@@ -56,13 +56,15 @@ the path in `[gcode_shell_command k1_lidar_start]`) and what you need from
 |---|---|---|
 | START_PRINT, first thing (`_SAF_START_PRINT_START`) | `_LIDAR_PRINT_START` | first-layer check |
 | START_PRINT, instead of `BED_MESH_CALIBRATE` (`_START_PRINT_BED_MESH`) | `_LIDAR_START_PRINT_MESH ADAPTIVE=1` | LiDAR mesh with the `LiDAR_Mesh` switch |
-| START_PRINT, after the mesh and the nozzle touch (`_SAF_START_PRINT_AFTER_BED_MESH`) | `_FIRST_LAYER_OFFSET {rawparams}` then `_LIDAR_PRINT_SCAN {rawparams}` | learned Z offset, PA test, first-layer check |
+| START_PRINT, after the mesh and the nozzle touch (`_SAF_START_PRINT_AFTER_BED_MESH`) | `_FIRST_LAYER_OFFSET {rawparams}`, `_LIDAR_FLOW_APPLY {rawparams}`, then `_LIDAR_PRINT_SCAN {rawparams}` | learned Z offset, saved flow (experimental, `FLOW_SAVE=1`), PA and PA/flow tests, first-layer check |
 | slicer layer change, layer 2 | `_FIRST_LAYER_AFTER` | first-layer check |
 | END_PRINT, before moving away (`_SAF_END_PRINT_START`) | `_LIDAR_PRINT_END` | first-layer check of one-layer prints |
 | CANCEL_PRINT (`_SAF_ON_CANCEL`) | `_LIDAR_PRINT_CANCEL` | first-layer check |
 
-Only add the lines for the features you use. `LIDAR_PA_CALIBRATION` needs
-`_LIDAR_PRINT_SCAN`.
+Only add the lines for the features you use. `LIDAR_PA_CALIBRATION` and
+`LIDAR_PA_FLOW_CALIBRATION` need `_LIDAR_PRINT_SCAN`. The driver serves the
+LiDAR's camera on port 8081 while the `LiDAR_Camera` switch is on; how to
+add it to Fluidd and the camera calibrations: [camera.md](camera.md).
 
 ## 5. First run
 

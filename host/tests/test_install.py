@@ -54,8 +54,12 @@ class TestInstall(unittest.TestCase):
                 root, "opt/freethebeam/driver/lidar-direct.py")))
             self.assertFalse(os.path.exists(os.path.join(
                 root, "opt/freethebeam/driver/tests")))
+            for f in ("lidar_service.py", "lidar_camera.py",
+                      "lidar_pa_flow.py", "lidar.py"):
+                self.assertTrue(os.path.exists(os.path.join(
+                    root, "opt/freethebeam/helper", f)), f)
             self.assertTrue(os.path.exists(os.path.join(
-                root, "opt/freethebeam/helper/lidar_service.py")))
+                root, "opt/freethebeam/driver/lidar-camera-off.jpg")))
             self.assertTrue(os.path.exists(os.path.join(
                 root, "etc/udev/rules.d/60-creality-lidar.rules")))
 

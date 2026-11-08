@@ -7,6 +7,106 @@ between minor versions).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
+The LiDAR's own camera: a webcam, pressure advance from photos of printed
+lines, and the laser offset from photos. Plus module status, stream mode and
+exposure that follows the plate. Camera background and results:
+[docs/camera.md](docs/camera.md).
+
+### Added
+- **`LIDAR_PA_FLOW_CALIBRATE`** (macro `LIDAR_PA_FLOW_CALIBRATION`): one
+  print, measured by the module's IR camera (line widths). The bare step
+  (exposure, plate photo, bare LiDAR strips) runs inside START_PRINT before
+  the purge (`_LIDAR_PRINT_SCAN` -> `LIDAR_PA_FLOW_STEP`); the helper plans
+  the G-code (`helper/lidar_pa_flow.py`), takes and analyses the photos
+  (`helper/lidar_camera.py`) and writes `pf-<job>.html`.
+  - **PA** from the bulge/thinning after speed changes, saved as `lidar_pa`.
+    K1 Max, white matte PLA on black smooth PEI: 0.0361 (r² 0.90), in use.
+    Needs contrast between filament and plate; on a bright plate the PA
+    falls back to LiDAR strips, otherwise nothing is saved.
+  - **Flow (experimental, opt-in)**: from the flow lines' width x the gap
+    under them. It came out ~4 % low against a printed A/B check (measured
+    108.6 %, 104 % looked best), so it is only reported by default;
+    `FLOW_SAVE=1` saves it per filament (`lidar_flow`), and the new
+    `_LIDAR_FLOW_APPLY` hook applies it as M221 at print start (and remembers
+    `last_filament_name`). Without a saved flow the hook sets M221 S100.
+- **`LIDAR_OFFSET_CALIBRATE` with the camera**: a 1-layer cross (arms ±7 mm)
+  photographed (fill light + laser line at the same pose) and scanned at Z1
+  and Z2; the camera's offsets are saved only when camera and LiDAR agree
+  within 0.15 mm.
+- **Camera webcam**: `lidar-direct.py --camera-port N` serves `/` and
+  `/snapshot`, only while the camera switch is on (`--camera-switch`,
+  default the new `LiDAR_Camera` output pin, `none` = always) and the LiDAR
+  has been idle for 10 s; the fill light is off for every LiDAR request.
+  `--webcam NAME` enables/disables that Moonraker webcam with the switch.
+  `k1max/lidar-start.sh` starts it on port 8081.
+- **Exposure per job**: with the helper, every scan, mesh, first-layer check
+  and calibration first picks the lowest exposure that sees the whole laser
+  line (black smooth PEI needs ~4000, textured PEI 1000), once per print or
+  command; the first-layer check's strip width follows the usable line.
+- `LIDAR_STATUS`: firmware, serial, module temperature; `SELFTEST=1` (the
+  module's laser/light test), `AMBIENT=1` (points with the laser off).
+- `LIDAR_STREAM_MODE MODE=0|1` (`lidar-direct.py --stream-mode`): continuous
+  capture, ~10.7 instead of ~5 frames/s, its own `LIDAR_TIMING`; off by
+  default.
+- Module temperature before/after meshes and calibrations (console, and
+  `lidar_runs.jsonl` next to `klippy.log`).
+- Driver requests `ir_photo`, `set/get_stream_mode`, `get_sensor_temp`,
+  `get_module_info`, `get_timings`, `self_test`, `ambient_points`;
+  `lidar_serial.py`: `capture_jpeg` (0x56 type 2 only, pipelined 0x57),
+  `get_cal_param`, `self_test`, `set/get_stream_mode`, decoded temperature.
+- `[lidar] camera:` (default True when `x_dir` is -1): the photo analysis
+  assumes the K1 Max mounting; without the helper or the camera
+  `LIDAR_PA_CALIBRATE` and `LIDAR_OFFSET_CALIBRATE` keep their LiDAR-only
+  prints. `LIDAR_SETUP_CHECK` reports the camera state.
+- Tests: driver camera/stream/status requests against the fake module,
+  `klipper/tests/test_pa_flow.py` (calibration steps, flow opt-in, placement,
+  exposure per job, camera dispatch), `test_flow_apply.py`,
+  `test_reduce.py`, `test_cross_lidar.py`; helper `test_pa_flow_plan.py`,
+  `test_camera.py` and `test_service_pf.py` on photos from the K1 Max
+  (`helper/tests/fixtures/camera/`; need numpy + PIL, CI installs them).
+
+### Changed
+- `LIDAR_PA_CALIBRATE` runs `LIDAR_PA_FLOW_CALIBRATE` when the helper and the
+  camera are available (same parameters; X=/Y= mean the new layout).
+- Scan rows are reduced by the **median** per 0.05 mm bin instead of the
+  mean (a stray point from room light or gloss no longer pulls a bin).
+- `cross_fit` (LiDAR offset cross) accepts arms that read low: thin white
+  lines show ~0.1 of 0.2 mm (threshold 0.25 instead of 0.5 x the height).
+- The test prints (PA, PA/flow, offset cross, Creality pattern) no longer
+  need the printer homed before they start; START_PRINT homes.
+- The driver refuses 0x58 (watchdog time, written to flash) and 0xAB.
+- The helper's install scripts copy `lidar_camera.py` and `lidar_pa_flow.py`
+  and warn when numpy/PIL are missing (only the camera calibrations need
+  them).
+
+### Fixed
+- The plugin reconnects once when the driver was restarted since the last
+  request (broken pipe) instead of failing the command.
+
+### Known issues
+- Camera flow is ~4 % low (opt-in only); camera calibrations tested on one
+  plate and one filament.
+- Stop-mode `LIDAR_SCAN` measures the exposure before moving to the scan XY;
+  `LIDAR_PA_FLOW_STEP` PHOTOS/ANALYZE don't refuse when BARE never ran; the
+  first-layer strip width assumes the usable line is centred; the LiDAR PA
+  fallback hides its reason and accepts 4 lines / r² 0.5; old plain-number
+  `lidar_flow` entries aren't clamped; `FLOWS=` isn't validated; an error in
+  a step aborts the print without END_PRINT.
+- The LiDAR reads thin translucent lines and single layers low (laser light
+  spreads in the plastic): first-layer thickness of thin white PLA reads
+  low, which is why PA and flow use the camera.
+
+### Upgrading
+- Helper: re-run `helper/install.sh` (or `host/install.sh --helper`) and
+  `apt install python3-numpy python3-pil` for the camera calibrations.
+- Printer config: add `_LIDAR_FLOW_APPLY {rawparams}` to START_PRINT next
+  to `_FIRST_LAYER_OFFSET`, and the new `_LIDAR_PRINT_SCAN`,
+  `LIDAR_PA_FLOW_CALIBRATION` and (optional) `[output_pin LiDAR_Camera]`
+  from `lidar.example.cfg`.
+- Run `LIDAR_TIMING` again if you switch `LIDAR_STREAM_MODE`.
+
 ## [0.3.2] - 2026-11-02
 
 ### Fixed
@@ -159,7 +259,8 @@ First public release.
 - Helper service for a second computer, K1 Max boot script, protocol, pinout
   and install docs, offline tests with a fake module.
 
-[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.2.0...v0.3.0

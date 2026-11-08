@@ -20,7 +20,7 @@ import termios
 import time
 
 # FreeTheBeam release (also in klipper/lidar.py and CHANGELOG.md)
-__version__ = '0.3.2'
+__version__ = '0.4.0'
 
 PORT = '/dev/serial/by-id/creality-laser'
 BAUD = termios.B1500000
@@ -42,22 +42,29 @@ SET_EXP, GET_EXP = 0x15, 0x16
 SET_GAIN, GET_GAIN = 0x17, 0x18
 GET_IR_SENSOR_TEMP = 0x1C
 GET_SN = 0x1D
+GET_CAL_PARAM = 0x1E
+SELF_TEST = 0x20
+CAPTURE_IR, GET_IR = 0x56, 0x57
 GET_STATUS = 0x55
 GET_AUTH_STRING = 0xA0
 SET_KEY = 0xA1
 
 # replies without a status byte (checked against every firmware handler)
 VALUE_REPLIES = {GET_VERSION, GET_PC_MODE, GET_PC_LEVEL, GET_ROI, GET_STREAM_MODE,
-                 GET_COOR, GET_EXP, GET_GAIN, GET_STATUS, 0x59}
+                 GET_COOR, GET_EXP, GET_GAIN, GET_STATUS, 0x59, SELF_TEST}
 
 # never sent unless allow_unsafe: sticker calibration (stores geometry in the
 # module), OTA, factory restore, baud change (saved to the module's flash, the
 # stock middleware then can't talk to it), IR image capture (hangs the module),
-# authorize-flag backdoor
+# authorize-flag backdoor, watchdog time (written to flash), deliberate hang.
+# Frames always start with 0xAF here: the module's second protocol (0xF5
+# frames, no authorization, writes serial number and calibration to flash)
+# is never sent.
 UNSAFE = {0x05: 'calibration', 0x10: 'start_ota', 0x12: 'restore',
           0x19: 'set_ota_file_info', 0x1A: 'trans_ota_file',
           0x1B: 'point_cloud_uart_cfg', 0x56: 'capture_ir',
-          0xAA: 'set_authorize_flag'}
+          0x58: 'set_watchdog_time', 0xAA: 'set_authorize_flag',
+          0xAB: 'test_watchdog_hang'}
 
 # socket-API compatible codes (cx_ai_middleware: 101 not ready, 102 failed)
 NOT_READY, FAILED = 101, 102
@@ -176,10 +183,10 @@ class LidarSerial:
         self.ready = False
 
     # -- requests ----------------------------------------------------------
-    def request(self, cmd, payload=b'', timeout=None):
+    def request(self, cmd, payload=b'', timeout=None, _checked=False):
         """Send one command, return the reply data (after the status byte for
         commands that have one). Raises LidarError on timeout or bad status."""
-        if cmd in UNSAFE and not self.allow_unsafe:
+        if cmd in UNSAFE and not (self.allow_unsafe or _checked):
             raise LidarError('refusing unsafe command 0x%02x (%s)' % (cmd, UNSAFE[cmd]))
         if self.fd is None:
             raise LidarError('port not open', NOT_READY)
@@ -206,6 +213,46 @@ class LidarSerial:
                 if body[0] != 0:
                     raise LidarError('0x%02x status %d' % (cmd, body[0]), body[0])
                 return body[1:]
+
+    def pipeline(self, cmd, payload, count, depth=4, timeout=3.0):
+        """`count` identical requests with up to `depth` in flight; returns
+        the replies' data (after the status byte) in order."""
+        frame = build_frame(cmd, payload)
+        out, sent = [], 0
+        try:
+            while sent < min(depth, count):
+                os.write(self.fd, frame)
+                sent += 1
+            deadline = time.monotonic() + timeout
+            while len(out) < count:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise LidarError('timeout in pipelined 0x%02x (%d of %d)'
+                                     % (cmd, len(out), count))
+                r, _, _ = select.select([self.fd], [], [], left)
+                if not r:
+                    continue
+                data = os.read(self.fd, 16384)
+                if not data:
+                    raise LidarError('port closed')
+                for src, rcmd, body in self.parser.feed(data):
+                    if src != 2 or rcmd != cmd:
+                        continue
+                    if not body or body[0] != 0:
+                        raise LidarError('0x%02x status %d' % (cmd, body[0] if body else -1),
+                                         body[0] if body else FAILED)
+                    out.append(body[1:])
+                    deadline = time.monotonic() + timeout
+                    if sent < count:
+                        os.write(self.fd, frame)
+                        sent += 1
+            return out
+        except LidarError:
+            # drop the replies still on the way so they can't answer later requests
+            time.sleep(0.3)
+            termios.tcflush(self.fd, termios.TCIFLUSH)
+            self.parser = FrameParser()
+            raise
 
     def _log(self, msg):
         if self.log:
@@ -257,6 +304,17 @@ class LidarSerial:
     def get_point_cloud_level(self):
         return self.request(GET_PC_LEVEL)[0]
 
+    def set_stream_mode(self, mode):
+        """0 (stock): each GET_POINT_CLOUD starts one capture and waits for
+        it (~5 frames/s). 1: the module captures continuously and
+        GET_POINT_CLOUD returns the next finished frame (~10.7 frames/s,
+        each ~1 frame older). RAM only (0 after a module restart); the
+        stream must be off."""
+        self.request(SET_STREAM_MODE, bytes((mode,)))
+
+    def get_stream_mode(self):
+        return self.request(GET_STREAM_MODE)[0]
+
     def set_exposure(self, value):
         self.request(SET_EXP, struct.pack('<I', value)[:3])
 
@@ -278,5 +336,67 @@ class LidarSerial:
         return struct.unpack('<HH', self.request(GET_ROI)[:4])
 
     def get_sensor_temp(self):
-        """Raw 4 bytes (format not decoded yet)."""
-        return self.request(GET_IR_SENSOR_TEMP)
+        """Module temperature in C (NTC next to the image sensor, ~50 ms).
+        The firmware doesn't compensate for it; >= 75 C makes stream_on
+        answer 'over temperature' but the stream still starts."""
+        return struct.unpack('<f', self.request(GET_IR_SENSOR_TEMP)[:4])[0]
+
+    def get_timings(self):
+        """Patched module firmware >= 1.0.16 (not Creality's stock 1.0.13;
+        FreeTheBeam doesn't ship it): the 0x1C reply also carries the
+        module's own timing numbers, else None. fps: sensor frames/s; alg_ms: last frame's copy + line finding;
+        alg_op_ms: line finding only; wait_ms: last 0x04 request's wait."""
+        r = self.request(GET_IR_SENSOR_TEMP)
+        if len(r) < 12:
+            return None
+        fps, alg, alg_op, wait = struct.unpack('<4H', r[4:12])
+        return {'temp': round(struct.unpack('<f', r[:4])[0], 2), 'fps': fps,
+                'alg_ms': alg, 'alg_op_ms': alg_op, 'wait_ms': wait}
+
+    def capture_jpeg(self, res=1, laser=False):
+        """One IR picture as JPEG (0x56 type 2 + 0x57 download): res 0 800x300
+        (patched firmware >= 1.0.17: the centred 512x288 window, 16:9), 1 800x600,
+        2 1600x600, 3 1600x1200; ~0.5-2.5 s. Only type 2 is sent
+        (type 0 hangs the module). The module needs the stream off for it
+        (which also switches the laser off; laser=True switches it on again
+        for a picture of the laser line); the caller restores its state."""
+        if res not in (0, 1, 2, 3):
+            raise LidarError('res must be 0..3', 103)
+        try:
+            self.request(STREAM_OFF)
+        except LidarError as e:
+            if e.code == FAILED:
+                raise
+        if laser:
+            self.request(LASER_SWITCH, b'\x01')
+        r = self.request(CAPTURE_IR, bytes((2, res)), timeout=15, _checked=True)
+        size = r[0] | r[1] << 8 | r[2] << 16
+        data = bytearray()
+        try:
+            # 0x57 replies come back in order: keep a few requests in
+            # flight so the link never idles (147 vs 95 KB/s)
+            for chunk in self.pipeline(GET_IR, b'\x00', -(-size // 2000)):
+                data += chunk
+        finally:
+            try:
+                self.request(GET_IR, b'\x02', timeout=3)     # free it
+            except LidarError:
+                pass
+        if len(data) != size or data[:2] != b'\xff\xd8':
+            raise LidarError('IR picture incomplete (%d of %d bytes)' % (len(data), size))
+        return bytes(data)
+
+    def get_cal_param(self):
+        """The module's calibration (read only): laser plane a,b,c,d (camera
+        frame, mm), R (3x3, row-major) and T (mm) to the calibration board,
+        intrinsics fx, fy, cx, cy, k1, k2, k3, p1, p2 (the point code uses
+        f = (fx+fy)/2, cx, cy; the distortion terms are never applied)."""
+        v = struct.unpack('<25f', self.request(GET_CAL_PARAM)[:100])
+        return {'plane': v[0:4], 'R': v[4:13], 'T': v[13:16],
+                'intrinsics': v[16:25]}
+
+    def self_test(self):
+        """Laser and fill-LED brightness check (~1-2 s). Needs the stream
+        off; leaves laser and LED off. 0 = ok, bit 0 laser weak, bit 1 LED
+        weak, 4 IR sensor error, 0xFF brightness grab failed."""
+        return self.request(SELF_TEST, timeout=max(self.timeout, 5.0))[0]

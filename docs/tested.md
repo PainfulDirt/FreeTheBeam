@@ -2,8 +2,9 @@
 
 Everything in this release runs on the development printer: a **Creality K1
 Max** with Simple AF (Pellcorp) + Kalico, Microprobe V2, load cells, glass bed
-+ textured PEI, LiDAR firmware 1.0.13, helper service on a Raspberry Pi 4
-(1 GB). Dates are when a feature was verified; "in use" means it has run in
++ textured PEI (black smooth PEI for the camera work, since ~2026-11-03),
+LiDAR firmware 1.0.13 (the camera work: the developer's own patched module
+firmware, see below), helper service on a Raspberry Pi 4 (1 GB). Dates are when a feature was verified; "in use" means it has run in
 normal prints since then.
 
 ## Driver and scanning
@@ -16,13 +17,22 @@ normal prints since then.
 | Dwell scans locked to the frames (`LIDAR_SCAN`) | 2026-10-12 | 51 rows in 12-14 s (was 20-21 s); 0 rows missed in 3 runs; matches a stop-mode scan within the scan noise |
 | Helper service + bridge | 2026-10-07, in use | Meshes, first-layer checks and analysis run on the Pi |
 | Boot script `lidar-start.sh` | in use | |
+| Stream mode 1 (`LIDAR_STREAM_MODE`) | 2026-11-02 | 10.7 instead of 5 frames/s; dwell strip 11 vs 13 s (moves dominate), meshes ~12 µm rms noisier: left at 0 |
+| `LIDAR_STATUS` firmware/serial/temperature, `SELFTEST=1`, `AMBIENT=1` | 2026-11-02 | ~615 points per frame with the laser off in room light |
+| Camera webcam (`--camera-port`, `LiDAR_Camera` switch) | 2026-11-02, in use | ~1.5 pictures/s at 512x288 on the developer's patched module firmware 1.0.18 (stock 1.0.13: 800x300, ~1/s, not measured as carefully) |
+| `ir_photo` (1600x1200 JPEG through the driver) | 2026-11-08 | 3.3 s (fill light) / 2.4 s (laser); exposure and stream restored |
+| Exposure per job (`auto_exposure`) | 2026-11-08 | Black smooth PEI: 1000 -> 887 points, 4000 -> 1472 (full line); bare-plate height the same within 2 µm at 1000-8000 |
+| Median per bin in scan rows | deployed 2026-11-08 | offline test; no separate before/after comparison |
 
 ## Calibrations
 
 | Feature | Tested | Result |
 |---|---|---|
-| `LIDAR_OFFSET_CALIBRATION` | 2026-10-06 | Laser line at nozzle X -36 / Y -21.2 (Creality's stock value: -23.2 in Y) |
-| `LIDAR_PA_CALIBRATION` | by 2026-10-07 | PA 0.0431 for a PETG |
+| `LIDAR_OFFSET_CALIBRATION` (LiDAR, 2-layer cross) | 2026-10-06 | Laser line at nozzle X -36 / Y -21.2 (Creality's stock value: -23.2 in Y) |
+| `LIDAR_OFFSET_CALIBRATION` with the camera (1-layer cross) | 2026-11-08: the cross is found in real photos at both heights (offline test on them); a full saved run not yet | camera vs LiDAR agreement check (0.15 mm) tested offline |
+| `LIDAR_PA_CALIBRATION` (LiDAR) | by 2026-10-07 | PA 0.0431 for a PETG; on thin white PLA on black PEI the LiDAR reads the lines low and PA scattered (0.0475 / 0.0302) |
+| `LIDAR_PA_FLOW_CALIBRATION` (camera), PA | 2026-11-08, white matte PLA on black smooth PEI | **PA 0.0361** (r² 0.90), saved and in use |
+| `LIDAR_PA_FLOW_CALIBRATION` (camera), flow | 2026-11-08 | 0.921 -> M221 S108.6, but a printed A/B check (pads at 100 / 104.3 / 108.6 %) looked best at 104 %: **~4 % low**, so flow is experimental and only saved with `FLOW_SAVE=1` |
 | `SKEW_SCAN` / `SKEW_CALIBRATE` | 2026-10-30, in use | -0.20° (-0.35 mm per 100 mm), saved as skew profile `lidar` |
 | `AXIS_TWIST_TOUCH_CALIBRATE` (probe + LiDAR twist tables in one run) | 2026-10-29, 2026-11-01 | Probe and LiDAR see the X-beam twist with opposite signs; tables saved and used |
 | `LIDAR_TWIST_CALIBRATE AXIS=X/Y` | 2026-11-01 | Y error +22 ± 4 µm/100 mm (cold bed), confirmed by A/B prints |
@@ -66,3 +76,10 @@ normal prints since then.
 - Running without the helper service beyond basic scans.
 - The connector pinout ([pinout.md](pinout.md)).
 - 2.5 Mbaud on the serial link (needs a setting stored in the module's flash).
+- The camera calibrations on any other plate/filament than white matte PLA
+  on black smooth PEI, on stock module firmware 1.0.13 (the 2026-11-08 runs
+  were on the developer's patched 1.0.18 build; the 1600x1200 pictures the
+  calibrations use are the same capture command), or with any module mount
+  other than the K1 Max's.
+- The camera webcam on mainline Klipper (`--camera-switch none`) and
+  `--webcam` with Mainsail.

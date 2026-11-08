@@ -23,7 +23,11 @@ class FakeModule(threading.Thread):
         threading.Thread.__init__(self, daemon=True)
         self.fd, self.points = fd, points
         self.authorized, self.stream, self.key = False, False, None
-        self.level, self.exp, self.gain = 0, 1000, 1000
+        self.level, self.exp, self.gain, self.mode = 0, 1000, 1000, 0
+        self.selftest = 0
+        self.captures, self.ir, self.led = 0, b'', 0
+        self.laser, self.exp_log, self.fail_capture = 0, [], False
+        self.timings = False             # firmware >= 1.0.16 adds them to 0x1C
         self.parser = ls.FrameParser()
         self.seen = []
         self.noise = True
@@ -68,7 +72,13 @@ class FakeModule(threading.Thread):
             self.reply(cmd, b'\x01\x00\x0d')
         elif cmd == 0x1D:
             self.reply(cmd, b'\x00' + bytes(range(1, 13)))
-        elif cmd in (0x0E, 0x13, 0x14):
+        elif cmd == 0x14:                    # fill light
+            self.led = p[0]
+            self.reply(cmd, b'\x00')
+        elif cmd == 0x13:                    # laser
+            self.laser = p[0]
+            self.reply(cmd, b'\x00')
+        elif cmd == 0x0E:
             self.reply(cmd, b'\x00')
         elif cmd == 0x01:
             self.stream = True
@@ -76,8 +86,38 @@ class FakeModule(threading.Thread):
         elif cmd == 0x02:
             self.stream = False
             self.reply(cmd, b'\x00')
+        elif cmd == 0x0C:                    # set_stream_mode: only with stream off
+            ok = not self.stream and p[0] < 2
+            if ok:
+                self.mode = p[0]
+            self.reply(cmd, b'\x00' if ok else b'\x01')
+        elif cmd == 0x0D:
+            self.reply(cmd, bytes((self.mode,)))
+        elif cmd == 0x1C:                    # module temperature, float32 C
+            self.reply(cmd, b'\x00' + struct.pack('<f', 43.5)
+                       + (struct.pack('<4H', 10, 88, 80, 92) if self.timings else b''))
+        elif cmd == 0x1E:                    # calibration: 25 float32
+            self.reply(cmd, b'\x00' + struct.pack('<25f', *[i * 0.5 for i in range(25)]))
+        elif cmd == 0x56:                    # IR capture (type 2 JPEG), stream must be off
+            if self.stream:
+                self.reply(cmd, b'\x04')
+            elif self.fail_capture:
+                self.reply(cmd, b'\x05')
+            else:
+                self.captures += 1
+                self.ir = b'\xff\xd8' + bytes([self.captures]) * 4500 + b'\xff\xd9'
+                self.reply(cmd, b'\x00' + len(self.ir).to_bytes(3, 'little'))
+        elif cmd == 0x57:                    # IR download: 0 next chunk, 2 done
+            if p[0] == 0:
+                chunk, self.ir = self.ir[:2000], self.ir[2000:]
+                self.reply(cmd, b'\x00' + chunk)
+            else:
+                self.reply(cmd, b'\x00')
+        elif cmd == 0x20:                    # self test: laser + LED off after it
+            self.stream = False
+            self.reply(cmd, bytes((self.selftest,)))
         elif cmd == 0x04:
-            if not self.stream:
+            if not self.stream and not self.mode:   # mode 1 skips the check
                 self.reply(cmd, b'\x04')     # "please turn on stream"
             else:
                 pts = self.points[::1 << self.level]
@@ -89,6 +129,7 @@ class FakeModule(threading.Thread):
             self.reply(cmd, bytes((self.level,)))
         elif cmd == 0x15:
             self.exp = int.from_bytes(p[:3], 'little')
+            self.exp_log.append(self.exp)
             self.reply(cmd, b'\x00')
         elif cmd == 0x16:
             self.reply(cmd, self.exp.to_bytes(3, 'little'))

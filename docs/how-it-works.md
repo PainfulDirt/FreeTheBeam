@@ -67,7 +67,9 @@ the same rows both times and subtract a bare-plate scan.
 For bed meshes the toolhead does not stop: mesh levels 1-3 take frames while
 moving along columns at constant speed (60-150 mm/s). Each frame is placed
 with Klipper's trapq (the planned motion) over the frame's exposure window,
-and frames taken while accelerating are dropped. A mesh point averages the
+and frames taken while accelerating are dropped. A scan row's points are
+reduced to 0.05 mm bins by the median per bin (since 0.4.0; a stray point
+from room light or gloss doesn't pull a bin). A mesh point averages the
 profile over a few mm (`HALF_X`), which smooths the plate's texture. Level 4
 scans strips with the whole 28 mm laser line; level 5 adds nozzle touches
 and fits the LiDAR mesh to them. Corrections for the X-beam twist and the

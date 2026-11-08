@@ -33,8 +33,16 @@ and LiDAR-measured calibrations.
   the print and the first layer at layer 2, and reports the real thickness
   map (test print: 0.194 mm measured for 0.200 mm sliced). It can learn the
   Z offset per filament. [Details](docs/first-layer.md).
+- **The module's camera** (since 0.4.0, with the helper). Pressure advance
+  from photos of printed lines (`LIDAR_PA_FLOW_CALIBRATE`; the LiDAR reads
+  thin translucent lines low, the camera measures their width to a few µm),
+  the laser offset from photos of a 1-layer cross, and a webcam for
+  Fluidd/Mainsail. Flow from the same print is experimental (read ~4 % low
+  against a printed check) and only saved on request.
+  [Details](docs/camera.md).
 - **Calibrations**: pressure advance measured from a printed test, the
-  LiDAR's own position, XY skew without calipers, frame timing.
+  LiDAR's own position, XY skew without calipers, frame timing; the
+  exposure follows the plate (dark or glossy sheets need more light).
 - **K1 Max extras** (`k1max/k1max-extras.cfg`, `klipper/`): keep-out zones,
   nozzle wipe on the plate edge, True Zero touch (Z=0 from a load-cell nozzle
   touch, checked by the probe), and a twist calibration that measures the
@@ -50,7 +58,7 @@ and LiDAR-measured calibrations.
 | | Status |
 |---|---|
 | Creality K1 Max, Simple AF (Pellcorp) + Kalico | developed and tested here: [what was tested](docs/tested.md) |
-| LiDAR module firmware 1.0.13 | tested |
+| LiDAR module firmware 1.0.13 | tested (the 0.4.0 camera work ran on the developer's own patched build of it, 1.0.18; the calibrations' capture command is the stock one) |
 | Any Cartesian/CoreXY Klipper or Kalico printer with the module mounted | supported, untested: [install-other-printer](docs/install-other-printer.md); reports welcome |
 | The module on any Linux machine (driver only) | should work (standard-library Python 3.8+) |
 
@@ -82,7 +90,8 @@ python3 driver/examples/dump_profile.py --out profile.json
   dwell and moving scans
 - [Command reference](docs/commands.md): every G-code command, macro and
   saved variable
-- [Bed mesh](docs/bed-mesh.md) and [first-layer check](docs/first-layer.md)
+- [Bed mesh](docs/bed-mesh.md), [first-layer check](docs/first-layer.md)
+  and [the camera](docs/camera.md)
 - [What has been tested](docs/tested.md), with results
 - [Protocol](docs/protocol.md): socket API and serial protocol
 - [Pinout](docs/pinout.md): what is verified about the hardware
@@ -92,7 +101,8 @@ python3 driver/examples/dump_profile.py --out profile.json
 
 > [!WARNING]
 > Some module commands **permanently change or hang the module**: sticker
-> calibration (0x05), IR image capture (0x56), UART config (0x1B), firmware
+> calibration (0x05), IR image capture with type 0 (0x56; the driver only
+> sends type 2, JPEG), UART config (0x1B), watchdog time (0x58), firmware
 > update and restore. The driver refuses all of them; do not work around it.
 > The full list is at the top of [docs/protocol.md](docs/protocol.md).
 >
@@ -105,11 +115,15 @@ the scanned area clear, and do not run heavy analysis on the K1 itself.
 
 ## Limitations
 
-- Developed and tested on **one** K1 Max (glass bed, textured PEI).
+- Developed and tested on **one** K1 Max (glass bed, textured PEI; the
+  camera calibrations on black smooth PEI with white matte PLA only).
+- Camera flow is experimental (~4 % low against a printed check), and the
+  camera analysis assumes the K1 Max's module mounting.
 - The connector pinout is not measured yet ([pinout.md](docs/pinout.md) says
   how to help).
-- Heights of thin printed lines are approximate (the laser sheet has a
-  thickness): widths and areas are reliable, single peaks are not.
+- The LiDAR reads thin translucent lines and single layers low (the laser
+  light spreads inside the plastic): a 0.2 mm white PLA line read 0.11-0.19
+  mm. That is why PA and flow use the camera.
 - The module delivers at most ~5 frames/s and each frame is ~0.19 s old on
   arrival.
 
@@ -120,7 +134,11 @@ The tests use a simulated module and printer, no hardware:
 ```
 python3 -m unittest discover -s driver/tests
 python3 -m unittest discover -s klipper/tests
+python3 -m unittest discover -s helper/tests
 ```
+
+The macro tests need jinja2, the camera tests numpy and PIL (they skip
+without them).
 
 ## Contributing
 

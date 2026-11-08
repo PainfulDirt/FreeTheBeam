@@ -32,8 +32,14 @@ DRIVER=$(sed -n "s/^lidar_driver = '\(.*\)'/\1/p" /usr/data/printer_data/config/
 if [ "$DRIVER" != middleware ]; then
     DRIVER=direct
     killall cx_ai_middleware > /dev/null 2>&1 && sleep 1
+    # module stream mode (variables.cfg lidar_stream_mode, LIDAR_STREAM_MODE):
+    # 1 = ~10.7 instead of ~5 frames/s. The IR camera on http port 8081,
+    # only while the LiDAR_Camera switch is on (docs/camera.md)
+    MODE=$(sed -n 's/^lidar_stream_mode *= *\([01]\) *$/\1/p' \
+        /usr/data/printer_data/config/variables.cfg 2> /dev/null)
     pgrep -f lidar-direct.py > /dev/null ||
-        setsid python3 -B $C/../driver/lidar-direct.py < /dev/null > /dev/null 2>&1 &
+        setsid python3 -B $C/../driver/lidar-direct.py --stream-mode ${MODE:-0} \
+            --camera-port 8081 < /dev/null > /dev/null 2>&1 &
 else
     for p in $(pgrep -f lidar-direct.py); do kill $p; done
     if ! pidof cx_ai_middleware > /dev/null; then

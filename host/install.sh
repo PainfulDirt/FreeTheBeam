@@ -49,7 +49,12 @@ if [ "$2" = "--helper" ]; then
     mkdir -p "$D/opt/freethebeam/helper" "$D/var/lib/lidar-helper"
     chown -R "$U" "$D/var/lib/lidar-helper"
     cp "$R/klipper/lidar.py" "$R/helper/lidar_service.py" \
+        "$R/helper/lidar_camera.py" "$R/helper/lidar_pa_flow.py" \
         "$D/opt/freethebeam/helper/"
+    # the camera calibrations' photo analysis (numpy + PIL, helper only)
+    python3 -c "import numpy, PIL" 2> /dev/null || echo "install.sh: the" \
+        "camera calibrations need numpy and PIL on this host:" \
+        "apt install python3-numpy python3-pil" >&2
     sed "s/KLIPPER_USER/$U/" "$R/host/lidar-helper.service" \
         > "$D/etc/systemd/system/lidar-helper.service"
 fi

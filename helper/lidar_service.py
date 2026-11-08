@@ -350,7 +350,209 @@ class Service:
                 f.write(benchmark_html(req["run"]))
             return {"ok": True, "json": base + ".json",
                     "html": base + ".html"}
+        # --- camera calibrations (numpy / PIL: imported only here)
+        if cmd == "auto_exposure":
+            return self.auto_exposure(req.get("min_cover", 0.95))
+        if cmd == "photo":
+            return self.photo(req)
+        if cmd == "pf_plan":
+            import lidar_pa_flow
+            return dict(lidar_pa_flow.plan_pa_flow(req["params"]), ok=True)
+        if cmd == "offset_plan":
+            import lidar_pa_flow
+            return dict(lidar_pa_flow.plan_offset_cross(req["params"]),
+                        ok=True)
+        if cmd == "pf_analyze":
+            return self.pf_analyze(req)
+        if cmd == "offset_cam":
+            return self.offset_cam(req)
         return {"ok": False, "error": "unknown command %r" % (cmd,)}
+
+    EXPOSURES = (1000, 2000, 4000, 8000)
+    FULL_LINE = 1520          # level 0 points of a fully seen line
+
+    def auto_exposure(self, min_cover=0.95):
+        """The lowest exposure that sees (nearly) the whole laser line: dark
+        or glossy plates need more light (black smooth PEI ~4000, textured
+        PEI 1000). Left set in the module (RAM only)."""
+        self.laser(True, 0)
+        table, xr = [], {}
+        try:
+            for e in self.EXPOSURES:
+                self.mw.call({"control": "set_laser_exposure", "exposure": e})
+                best = []
+                for _ in range(3):
+                    r = self.mw.call({"control": "get_point_cloud"})
+                    pc = r.get("result", {}).get("point_cloud", [])
+                    best.append(len(pc))
+                    if pc and len(pc) >= max(best):
+                        xs = [p[0] for p in pc]
+                        xr[e] = [round(min(xs) / 1000.0, 2),
+                                 round(max(xs) / 1000.0, 2)]
+                table.append([e, sorted(best)[1]])
+            top = max(n for e, n in table)
+            if top < 0.5 * self.FULL_LINE:
+                return {"ok": False, "error": "LiDAR sees less than half of"
+                        " the line at exposure %d (%d points): clean the"
+                        " window? plate in place?" % (table[-1][0], top)}
+            e = next(e for e, n in table if n >= min_cover * top)
+            self.mw.call({"control": "set_laser_exposure", "exposure": e})
+        finally:
+            self.laser(False)
+        return {"ok": True, "exposure": e, "points": dict(table)[e],
+                "x_range": xr.get(e, [-14.0, 14.0]), "table": table}
+
+    def photo(self, req):
+        """One fill-light (or laser) picture through the driver, stored as
+        photos/<job>/<name>.jpg with its pose."""
+        import base64
+        t0 = time.time()
+        r = self.mw.call({"control": "ir_photo", "light": req.get("light", 1),
+                          "laser": req.get("laser", 0),
+                          "exposure": req.get("exposure", 1000), "res": 3},
+                         timeout=40.0)
+        res = r.get("result", {})
+        if res.get("code") or "jpeg" not in res:
+            return {"ok": False, "error": "photo %s failed (code %s)" % (
+                req["name"], res.get("code"))}
+        data = base64.b64decode(res["jpeg"])
+        d = os.path.join(self.data_dir, "photos", str(req["job"]))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, req["name"] + ".jpg"), "wb") as f:
+            f.write(data)
+        meta = dict((k, req.get(k)) for k in ("x", "y", "z", "exposure",
+                                              "light", "laser"))
+        meta.update(intr=res.get("intr"), time=time.time())
+        with open(os.path.join(d, req["name"] + ".json"), "w") as f:
+            json.dump(meta, f)
+        try:
+            import lidar_camera
+            med = float(lidar_camera.np.median(lidar_camera.load_gray(data)))
+        except Exception:     # the picture is stored; brightness is a hint
+            med = None
+        return {"ok": True, "file": os.path.join(d, req["name"] + ".jpg"),
+                "bytes": len(data), "secs": round(time.time() - t0, 2),
+                "intr": res.get("intr"), "median": med}
+
+    def offset_cam(self, req):
+        """LIDAR_OFFSET_CALIBRATE's camera part: the cross and the laser line
+        in the pictures taken at each height -> offsets."""
+        import lidar_camera as cam
+        d = os.path.join(self.data_dir, "photos", str(req["job"]))
+        per_z, intr = [], None
+        for p in req["photos"]:
+            imgs = []
+            for kind in ("light", "laser"):
+                with open(os.path.join(d, p[kind] + ".jpg"), "rb") as f:
+                    imgs.append(cam.load_gray(f.read()))
+                with open(os.path.join(d, p[kind] + ".json")) as f:
+                    intr = json.load(f).get("intr") or intr
+            per_z.append({"z": p["z"], "nozzle": p["nozzle"],
+                          "cross": cam.cross_from_photos(*imgs)})
+        if not intr:
+            return {"ok": False, "error": "no camera intrinsics with the photos"}
+        res = cam.offset_from_crosses(per_z, req["test"], intr[2],
+                                      req.get("ref_z", 3.0))
+        res["crosses"] = [p["cross"] for p in per_z]
+        res["ok_cam"] = res.pop("ok")
+        return dict(res, ok=True)
+
+    def _raw_rows(self, name):
+        """A saved scan's raw rows: (header, {y: points (N, 3) um})."""
+        import numpy as np
+        rows = {}
+        with open(os.path.join(self.data_dir, name + ".raw.jsonl")) as f:
+            hdr = json.loads(f.readline())
+            for line in f:
+                r = json.loads(line)
+                caps = [np.array(c, float) for c in r.get("caps", []) if c]
+                if caps:
+                    rows[r["y"]] = np.concatenate(caps)
+        return hdr, rows
+
+    def pf_analyze(self, req):
+        """LIDAR_PA_FLOW_CALIBRATE's analysis: PA from the photos at the
+        speed changes, flow from the triplet photos and the bare strips."""
+        import numpy as np
+        import lidar_camera as cam
+        test, job = req["test"], str(req["job"])
+        d = os.path.join(self.data_dir, "photos", job)
+
+        def photos(prefix):
+            out = []
+            for ph in test["photos"]:
+                fn = os.path.join(d, ph["name"] + ".jpg")
+                if ph["name"].startswith(prefix) and os.path.exists(fn):
+                    with open(fn, "rb") as f:
+                        out.append({"img": cam.load_gray(f.read()),
+                                    "x": ph["x"], "y": ph["y"],
+                                    "name": ph["name"]})
+            return out
+        tp, fp = photos("T"), photos("F")
+        pa_xs = [test["pa"]["x0"] + i * test["pa"]["pitch"]
+                 for i in range(len(test["pa"]["pa"]))]
+        fl_xs = [ln["x"] for g in test["flow"]["groups"] for ln in g["lines"]]
+        con = [cam.line_contrast(p["img"], cam.find_lines(p["img"], pa_xs, p["x"]))
+               for p in tp] + \
+            [cam.line_contrast(p["img"], cam.find_lines(p["img"], fl_xs, p["x"]))
+             for p in fp]
+        contrast = float(np.median(con)) if con else 0.0
+        low = contrast < cam.MIN_CONTRAST
+        # PA: camera, else the LiDAR scans when the bare step took them
+        pa = cam.pa_from_widths(tp, test["pa"]) if tp and not low else {
+            "ok": False, "reason": "camera contrast too low (%.0f grey"
+            " levels)" % (contrast,), "report": []}
+        method = "camera" if pa.get("ok") else "none"
+        if not pa.get("ok") and "pf_pa_base" in self.scans \
+                and "pf_pa_scan" in self.scans:
+            lr = self.handle({"cmd": "pa_analyze", "base": "pf_pa_base",
+                              "scan": "pf_pa_scan", "test": test["pa"]})
+            if lr.get("ok") and lr["result"].get("ok"):
+                pa, method = dict(lr["result"], camera_reason=pa.get(
+                    "reason")), "lidar"
+        # flow
+        if low or len(fp) < len(test["photos"]) - len(tp) or not fp:
+            flow = {"ok": False, "reason": "camera contrast too low (%.0f grey"
+                    " levels)" % (contrast,) if low else "flow photos"
+                    " missing", "report": []}
+        else:
+            fl = test["flow"]
+            ys = list(np.arange(fl["y0"] + 8.0, fl["y1"] - 7.0 + 1e-6, 1.0))
+            tables = req.get("tables") or {}
+            samples, notes = {}, []
+            for st in test["strips"]:
+                k = int(st["name"].rsplit("g", 1)[1])
+                ms = req.get("mesh", {}).get(st["name"])
+                try:
+                    hdr, rows = self._raw_rows(st["name"])
+                except (OSError, ValueError):
+                    notes.append("strip %s missing" % (st["name"],))
+                    continue
+                if not ms:
+                    notes.append("no mesh samples for %s" % (st["name"],))
+                    continue
+                my, mz = np.array(ms, float).T
+                samples[k] = cam.gap_pairs(
+                    rows, hdr.get("x", st["x"]), ys,
+                    lambda x, y: float(np.interp(y, my, mz)),
+                    tables.get("twist"), tables.get("ytwist"))
+            gaps = cam.group_gaps(samples)
+            flow = cam.flow_fit(cam.flow_widths(fp, fl), gaps,
+                                h0=fl.get("height", 0.2),
+                                w_nom=fl.get("width", 0.45),
+                                h_nom=fl.get("height", 0.2))
+            flow["gaps_um"] = dict((str(k), round(v * 1000, 1))
+                                   for k, v in gaps.items())
+            flow["notes"] = notes
+        res = {"pa": pa, "pa_method": method, "flow": flow,
+               "contrast": round(contrast, 1), "job": job}
+        base = os.path.join(self.data_dir, "pf-%s" % (job,))
+        with open(base + ".json", "w") as f:
+            json.dump(res, f)
+        with open(base + ".html", "w") as f:
+            f.write(pf_html(res, test, job))
+        res.update(ok=True, html=base + ".html")
+        return res
 
     def save_mesh(self, req, res):
         # the last mesh, and every mesh with a time stamp in meshes/: same
@@ -525,6 +727,46 @@ def fl_html(meta, plan, res, tmap):
                 _heat_svg(vals, tmap["x0"], plan["ys"][0], step, 0.1,
                           "thickness - %.2f mm (red thicker, blue thinner;"
                           " bare plate dark blue)" % (h0,))))
+
+
+def pf_html(res, test, job):
+    """LIDAR_PA_FLOW_CALIBRATE report: results, the PA scores against PA
+    (inline SVG), the flow lines, links to the photos."""
+    pa, fl = res["pa"], res["flow"]
+    rows = []
+    sc = [(p, s) for p, s in zip(test["pa"]["pa"], pa.get("scores") or [])
+          if s is not None]
+    svg = ""
+    if sc:
+        lo, hi = min(s for p, s in sc), max(s for p, s in sc)
+        span = (hi - lo) or 1.0
+        p0, p1 = test["pa"]["pa"][0], test["pa"]["pa"][-1]
+        X = lambda p: 20 + 360 * (p - p0) / ((p1 - p0) or 1.0)
+        Y = lambda s: 180 - 160 * (s - lo) / span
+        pts = "".join('<circle cx="%.1f" cy="%.1f" r="4"/>' % (X(p), Y(s))
+                      for p, s in sc)
+        zero = '<line x1="20" x2="380" y1="%.1f" y2="%.1f" stroke="#888"/>' % (
+            Y(0), Y(0)) if lo <= 0 <= hi else ""
+        svg = ('<svg width="400" height="200" style="background:#fff">%s%s'
+               '</svg>' % (zero, pts))
+    for line in (pa.get("report") or []) + (fl.get("report") or []):
+        rows.append("<div><code>%s</code></div>" % (line,))
+    pics = "".join('<a href="photos/%s/%s.jpg">%s</a> ' % (job, p["name"],
+                                                         p["name"])
+                   for p in test["photos"])
+    return ("<!doctype html><meta charset=utf-8><title>LiDAR PA + flow %s"
+            "</title><body style='font-family:sans-serif'>"
+            "<h2>PA %s (%s)</h2><h2>Flow %s</h2>"
+            "<p>camera contrast %.0f grey levels; gap differences %s um</p>"
+            "<h3>PA score per line (zero crossing = PA)</h3>%s<h3>Details</h3>"
+            "%s<h3>Photos</h3>%s</body>" % (
+                job, "%.4f" % pa["pa"] if pa.get("ok") else "not measured: %s"
+                % pa.get("reason"), res["pa_method"],
+                "%.3f (sd %.3f, dF/dh %.2f per mm)" % (fl["f"], fl["sd"],
+                                                         fl["dfdh"])
+                if fl.get("ok") else "not saved: %s" % (fl.get("reason"),),
+                res["contrast"], fl.get("gaps_um", {}), svg, "".join(rows),
+                pics))
 
 
 def benchmark_html(run):

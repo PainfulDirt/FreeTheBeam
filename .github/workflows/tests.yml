@@ -19,8 +19,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Test dependencies
-        # jinja2 renders the example macros like Klipper does
-        run: pip install jinja2
+        # jinja2 renders the example macros like Klipper does; numpy and
+        # pillow are the helper's camera analysis (helper only)
+        run: pip install jinja2 numpy pillow
       - name: Compile
         run: python -m compileall -q driver klipper helper
       - name: Driver tests

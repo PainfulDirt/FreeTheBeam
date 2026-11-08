@@ -12,11 +12,17 @@ one K1 Max. The driver in [`driver/`](../driver/) implements all of this.
 > - **0x05 calibration (sticker)**: stores wrong geometry in the module if your
 >   plate isn't at the stock height. Same for the middleware's
 >   `set_laser_cali_step`.
-> - **0x56 IR image capture** (middleware: `create_ir_image`): the module stops
->   answering until power-cycled.
+> - **0x56 IR image capture with type 0** (middleware: `create_ir_image`
+>   type 0): pushes the picture by YMODEM and waits forever for a receiver;
+>   the module stops answering until power-cycled. Types 1 (raw) and 2
+>   (JPEG) work; the driver only ever sends type 2 (`ir_photo`, the camera).
 > - **0x1B UART config**: saved in the module's flash. Anything that expects
 >   1.5 Mbaud can't talk to it afterwards.
 > - **0x10, 0x19, 0x1A OTA firmware update**, **0x12 restore** and **0xAA** (sets the "authorised" flag unchecked, a debug backdoor).
+> - **0x58 watchdog time** (written to flash) and **0xAB** (hangs on purpose).
+> - Frames starting with **0xF5** (a second protocol without authorization
+>   that can write the serial number and the calibration to flash): the
+>   driver only builds 0xAF frames.
 >
 > `driver/lidar_serial.py` refuses all of these (`UNSAFE`) and
 > `lidar-direct.py` answers code 103 to the matching socket commands.
@@ -39,6 +45,27 @@ per connection and stops accepting after a few thousand.
 
 Without `open_flow`, `get_point_cloud` returns code 4 and no points.
 
+lidar-direct.py also answers (since 0.4.0):
+
+```
+{"control": "set_stream_mode", "mode": 0|1} / "get_stream_mode"   module stream mode (below)
+{"control": "get_sensor_temp"}       -> {"temp": 46.1}            module temperature, C
+{"control": "get_module_info"}       -> version, sn, temp, timings, stream_mode, level, cal
+{"control": "get_timings"}           patched module firmware >= 1.0.16 only, else 103
+{"control": "self_test"}             -> {"self_test": 0, "laser_ok": true, "light_ok": true}
+{"control": "ambient_points"}        -> {"points": [n, n, n]}     points found with the laser off
+{"control": "ir_photo", "res": 3, "exposure": 1000, "light": 1, "laser": 0}
+                                     -> {"jpeg": base64, "w", "h", "exposure", "intr", "secs"}
+```
+
+`ir_photo` (the helper's camera calibrations) stops the stream, sets the
+exposure, fill light and laser as asked, takes one JPEG (0x56 type 2 + 0x57)
+and puts exposure, laser and stream back as they were, also when the capture
+fails; `intr` are the camera's fx, fy, cx, cy from 0x1E. With `--camera-port
+N` the driver also serves the camera over HTTP (`/` a page, `/snapshot` one
+JPEG), only while the camera switch is on and the LiDAR has been idle for
+10 s (docs/camera.md).
+
 All commands (dispatch table in `.rodata`): `open_flow close_flow
 get_point_cloud get_level_value set_point_cloud_level get_point_cloud_level
 module_restart set_laser_open set_laser_close set_fill_light_open
@@ -52,7 +79,11 @@ get_flow_detection_new get_first_floor_detect_new`
 Result codes seen: 0 ok, 4 no data, 101 LiDAR not ready, 102 the module
 refused, 103 missing/invalid parameters.
 
-**Don't use `create_ir_image`** (see the box at the top): `type` + `resolution`, both ints; this module refuses it (102) and then stops answering until power-cycled (`laser_power.sh off`, `on`, restart the middleware).
+`create_ir_image` (`type` + `resolution`, both ints) + `get_an_ir_image`
+(`file_path`, `file_size`): pictures from the LiDAR's camera through the
+middleware. **Never type 0** (see the box at the top). Type 1 = raw 8-bit,
+type 2 = JPEG; resolution 0 800x300, 1 800x600, 2 1600x600, 3 1600x1200.
+Creality uses type 2 (flow detection: resolution 3, fill light on).
 
 ## Serial protocol (host <-> LiDAR module)
 
@@ -79,10 +110,10 @@ answer `status + data`. Simple commands take ~8 ms.
 | 0x03 | software version | - | 3 bytes (1.0.13) |
 | 0x04 | **point cloud** | - | status + N x (x, y, z) int16 LE, µm (max 1600 points) |
 | 0x05 | calibration (sticker) | step | **never** (stores geometry in the module) |
-| 0x06 / 0x07 | point cloud mode set / get | mode | status / value |
-| 0x08 / 0x09 | point cloud level set / get | 0 all, 1 half, 2 quarter | status / value |
-| 0x0A / 0x0B | ROI set / get | x_min u16, x_max u16 (sensor columns 0..1600) | status / 4 bytes |
-| 0x0C / 0x0D | stream mode set / get (stream off only) | 0/1 | status / value |
+| 0x06 / 0x07 | point cloud mode set / get (RAM) | 0 normal, 1 ROI mode (resets the level to 0) | status / value |
+| 0x08 / 0x09 | point cloud level set / get (RAM) | 0 all, 1 half, 2 quarter, 3 / 4 coarse, 5 = 1600 slots, one per sensor column, (0,0,0) where nothing was found | status / value |
+| 0x0A / 0x0B | ROI set / get (only in point cloud mode 1) | x_min u16, x_max u16 (sensor columns 0..1600) | status / 4 bytes |
+| 0x0C / 0x0D | stream mode set / get (stream off only, RAM) | 0 one capture per 0x04 (~5 frames/s), 1 continuous (~10.7/s, frames ~1 older) | status / value |
 | 0x0E / 0x0F | coordinate mode set / get (init sets 1) | 1 | status / value |
 | 0x10, 0x19, 0x1A | OTA firmware update | | **never** |
 | 0x11 | reset | - | status |
@@ -92,16 +123,24 @@ answer `status + data`. Simple commands take ~8 ms.
 | 0x15 / 0x16 | exposure set / get | u24 LE (default 1000) | status / 3 bytes |
 | 0x17 / 0x18 | gain set / get | u24 LE (default 1000) | status / 3 bytes |
 | 0x1B | UART config | baud index (0 1.5M, 1 2M, 2 2.5M), flow control | **saved in the module's flash**: the middleware (fixed 1.5M) can't talk to it afterwards |
-| 0x1C | IR sensor temperature | - | status + 4 bytes |
+| 0x1C | module temperature (NTC next to the image sensor, ~50 ms) | - | status + float32 LE, C (nothing compensates for it) |
 | 0x1D | serial number | - | status + 12 bytes ASCII |
-| 0x1E | calibration parameters | - | status + 100 bytes |
-| 0x1F, 0x20 | debug print, self test | | |
+| 0x1E | calibration parameters (read only) | - | status + 25 float32: laser plane a,b,c,d (camera frame, mm), R 3x3, T (mm), fx fy cx cy k1 k2 k3 p1 p2 (the distortion terms are never applied) |
+| 0x1F | debug print (to the module's internal debug UART, not USB) | 0/1 | status |
+| 0x20 | self test (stream off first; leaves laser and fill light off) | - | code: 0 ok, bit 0 laser weak, bit 1 light weak, 4 IR sensor error, 0xFF failed |
 | 0x21 | point cloud in 2000-byte chunks | | |
 | 0x55 | status | - | error bits (0 = ok) |
-| 0x56 / 0x57 | IR image capture / download | | 0x56 **never** (hangs the module) |
-| 0x58 / 0x59 / 0xAB | watchdog | | |
+| 0x56 | IR picture capture | `type res` (type 0 **never**: YMODEM push, hangs; 1 raw, 2 JPEG) | status + size u24; stream must be off (status 4) |
+| 0x57 | IR picture download | mode: 0 next chunk, 1 resend last, 2 done (frees it) | status + up to 2000 bytes |
+| 0x58 / 0x59 / 0xAB | internal hang watchdog: set (**written to flash**) / get / hang on purpose | | 0x58 and 0xAB refused by the driver |
 | 0xA0 / 0xA1 | auth challenge / key | - / 32 bytes | see below |
 | 0xAA | set authorised flag | | sets the flag unchecked (debug backdoor) |
+
+IR pictures: ~19.4 µm/pixel at scan height (1600x1200 = ~31 x 23 mm), image
+column = printer -X, row = +Y on the K1 Max mount. The module encodes JPEGs
+in software (~0.8 s per Mpixel); several 0x57 requests in flight download at
+the full line speed (147 KB/s). Exposure (0..20000) and gain (1000..32000)
+live in RAM only.
 
 Before authentication the module only answers 0x55, 0xA0, 0xA1, 0xAA.
 **Authentication** (no secret): 0xA0 answers `status, 8 bytes`; negate each

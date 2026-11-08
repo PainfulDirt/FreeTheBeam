@@ -9,6 +9,8 @@ User=KLIPPER_USER
 SupplementaryGroups=dialout
 # the socket must be visible to Klipper in the normal /tmp
 PrivateTmp=no
+# optional: --stream-mode 1 (LIDAR_STREAM_MODE), --camera-port 8081 (the IR
+# camera over HTTP; --camera-switch none without a LiDAR_Camera output_pin)
 ExecStart=/usr/bin/python3 -B /opt/freethebeam/driver/lidar-direct.py --socket /tmp/ai_server_uds
 Restart=always
 RestartSec=5

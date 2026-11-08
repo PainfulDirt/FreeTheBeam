@@ -94,7 +94,8 @@ With the printer homed and the plate clear:
 
 1. `LIDAR_TIMING`: the frame timing, saved.
 2. `LIDAR_OFFSET_CALIBRATION EXTRUDER_TEMP= BED_TEMP=`: prints a small cross
-   and measures where the laser looks. Its result overrides `x_offset` /
+   and measures where the laser looks (with the helper's camera, mount like
+   the K1 Max's, it also photographs it: [camera.md](camera.md)). Its result overrides `x_offset` /
    `y_offset`. Repeat after changing the mount or the plate.
 3. `LIDAR_SETUP_CHECK` again: the area should now cover most of the bed.
 4. With a touch method: `LIDAR_MESH_CALIBRATION` (bed at print
