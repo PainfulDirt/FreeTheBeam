@@ -1,7 +1,8 @@
 """lidar.example.cfg's _LIDAR_FLOW_APPLY and _LIDAR_PRINT_SCAN rendered like
 Klipper does (jinja2 with { } delimiters): flow per filament from
-LIDAR_PA_FLOW_CALIBRATE FLOW_SAVE=1, corrected by the first-layer check's
-later learning (fl_zoffset); the PA/flow print's bare step in START_PRINT.
+LIDAR_PA_FLOW_CALIBRATE FLOW_METHOD=IR|LIDAR or LIDAR_FLOW_SAVE, corrected by
+the first-layer check's later learning (fl_zoffset); the PA/flow print's
+bare step in START_PRINT (file prints only).
 Skipped without jinja2."""
 import configparser
 import os
@@ -29,7 +30,7 @@ def render_flow_apply(variables, params, filename="part.gcode"):
     env = jinja2.Environment("{%", "%}", "{", "}", extensions=["jinja2.ext.do"])
     t = env.from_string(macro_source("_LIDAR_FLOW_APPLY"))
     out = t.render(params=params, printer={
-        "print_stats": {"filename": filename},
+        "print_stats": {"filename": filename, "state": "printing"},
         "save_variables": {"variables": variables}})
     return [l.strip() for l in out.splitlines() if l.strip()]
 
@@ -49,7 +50,7 @@ def render_print_scan(filename, fl_check=0):
     env = jinja2.Environment("{%", "%}", "{", "}", extensions=["jinja2.ext.do"])
     t = env.from_string(macro_source("_LIDAR_PRINT_SCAN"))
     out = t.render(params={}, x=0, y0=0, y1=0, printer={
-        "print_stats": {"filename": filename}, "extruder": {"target": 150.0},
+        "print_stats": {"filename": filename, "state": "printing"}, "extruder": {"target": 150.0},
         "output_pin First_Layer_Check": {"value": fl_check}})
     return [l.strip() for l in out.splitlines() if l.strip() and not l.strip().startswith("#")]
 
@@ -69,7 +70,8 @@ class PrintScanTests(unittest.TestCase):
         env = jinja2.Environment("{%", "%}", "{", "}")
         t = env.from_string(macro_source("_LIDAR_PRINT_SCAN"))
         out = t.render(params={}, x=142.0, y0=97.0, y1=223.0, printer={
-            "print_stats": {"filename": "lidar_pa_test.gcode"},
+            "print_stats": {"filename": "lidar_pa_test.gcode",
+                            "state": "printing"},
             "extruder": {"target": 220.0},
             "output_pin First_Layer_Check": {"value": 0}})
         lines = [l.strip() for l in out.splitlines() if l.strip()]

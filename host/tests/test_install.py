@@ -55,7 +55,7 @@ class TestInstall(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(
                 root, "opt/freethebeam/driver/tests")))
             for f in ("lidar_service.py", "lidar_camera.py",
-                      "lidar_pa_flow.py", "lidar.py"):
+                      "lidar_pa_flow.py", "lidar_bands.py", "lidar.py"):
                 self.assertTrue(os.path.exists(os.path.join(
                     root, "opt/freethebeam/helper", f)), f)
             self.assertTrue(os.path.exists(os.path.join(

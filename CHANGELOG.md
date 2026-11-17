@@ -7,6 +7,110 @@ between minor versions).
 
 ## [Unreleased]
 
+## [0.5.0] - unreleased
+
+Brings FreeTheBeam up to the development K1 Max's state of 2026-11-17: flow
+from one-layer bands, camera-vs-LiDAR benchmarks, calibration runs per build
+plate, rescans of weak mesh columns, a primed nozzle after the first-layer
+check, the helper service on the printer itself, and the fixes from a
+whole-codebase bug hunt.
+
+### Added
+- **Flow bands** (`helper/lidar_bands.py`, macro `LIDAR_FLOW_CALIBRATION`,
+  experimental): 6 one-layer bands of 14 x 10 mm at 92..112 % flow; the
+  flow is the first closed and smooth band, judged by the camera (gaps and
+  ridge pattern in a photo at exposure 1000) or by LiDAR strips (bare before
+  the purge, printed after; provisional rule). Replaces 0.4.0's flow
+  triplets (line width x gap).
+- **Methods and benchmarks**: `LIDAR_PA_FLOW_CALIBRATE TESTS=PA|FLOW|PA,FLOW
+  PA_METHOD=IR|LIDAR|BOTH FLOW_METHOD=IR|LIDAR|BOTH`. `BOTH` measures with
+  the camera and the LiDAR, saves nothing and asks (Fluidd/Mainsail
+  `action:prompt`) which result to save: **`LIDAR_PA_SAVE` /
+  `LIDAR_FLOW_SAVE METHOD=IR|LIDAR`** (refused for a stale benchmark unless
+  `FORCE=1`). Macros `LIDAR_PA_CALIBRATION METHOD=` and
+  `LIDAR_FLOW_CALIBRATION METHOD=` (default `BOTH`).
+- **`LIDAR_PLATE [NAME=] [RESET_RUNS=1]`**: calibration runs
+  (`LIDAR_TWIST_CALIBRATE`, `LIDAR_GRID_CALIBRATE`) are tagged with the
+  plate on the bed and meshes use only that plate's runs (untagged older
+  runs where it has none). `LIDAR_STATUS` warns when the plate has no runs.
+- **Rescan**: a moving mesh column with too few frames (under 30 % of the
+  median column, at most 2 columns) is scanned again before the mesh is
+  made, instead of a hole filled from its neighbours.
+- **Prime after the first-layer scan**: `FIRST_LAYER_SCAN PHASE=after TIP=5
+  PRIME=20` refills the oozed tip and lays a purge line in front of the
+  objects (else beside or behind them); `_FIRST_LAYER_AFTER` variables
+  `prime_tip` / `prime_purge`. The fitted first-layer line ramp is kept per
+  filament (`fl_line_ramp`) for parts too small to fit it.
+- **Local helper mode**: `lidar_service.py --profile printer` (6 scans, no
+  raw files, data folder trimmed to 200 MB) on the printer itself, started
+  by `k1max/lidar-start.sh` when `[lidar]` has `service: 127.0.0.1:<port>`
+  and the new **`service_local: True`**. Everything but the numpy work runs;
+  camera and flow calibrations are refused before printing,
+  `LIDAR_PA_CALIBRATE` / `LIDAR_OFFSET_CALIBRATE` use the LiDAR-only
+  variants, analysis timeouts are x3 (at most 300 s).
+  [install-helper.md](docs/install-helper.md#on-the-printer-itself-local-mode)
+- `lidar-start.sh restart` (from `LIDAR_DRIVER`) stops the driver, bridge
+  and local service (TERM, KILL after 5 s) and starts them again.
+- `_LIDAR_PRINT_CANCEL` puts PA (saved or config) and M221 S100 back after a
+  cancelled calibration print.
+
+### Changed
+- `LIDAR_PA_CALIBRATE` with the helper prints only the PA lines
+  (`TESTS=PA`, `METHOD=` default IR with the camera, else LIDAR); without
+  the helper or in local mode the LiDAR-only PA test as before.
+- `FLOW_SAVE=` is gone: `FLOW_METHOD=IR|LIDAR` saves, `BOTH` (the default)
+  doesn't. `FLOWS=` is validated (at least 3 rising factors).
+- Macros: `LIDAR_PA_FLOW_CALIBRATION` and `LIDAR_TWIST_CALIBRATION` removed
+  (use `LIDAR_FLOW_CALIBRATION` / `LIDAR_PA_FLOW_CALIBRATE TESTS=PA,FLOW`
+  and `LIDAR_MESH_CALIBRATION AXIS=X|Y`); `LIDAR_MESH_CALIBRATION RESET=1`
+  forgets only the current plate's runs.
+- The driver's camera switch is polled by its camera thread (never in the
+  serve loop); a failed Moonraker query keeps the last value instead of
+  switching the camera off; the serial port is locked between requests and
+  pictures. The helper's `Middleware` reconnects within one request's
+  deadline and accepts `unix:/path`.
+- The first-layer check scans at START_PRINT's speed limits (Simple AF's
+  `_START_END_PARAMS`, else the `[printer]` section's).
+
+### Fixed (K1 Max bug hunt, 2026-11-16)
+- Adaptive meshes of thin or small object areas collapsed to 20 mm in both
+  axes and could miss the zero reference; now each axis is widened on its
+  own, inside what the LiDAR sees. Non-adaptive meshes with out-of-reach
+  objects honour `FALLBACK=1`.
+- Helper connection: non-blocking connect (an unreachable helper froze
+  Klipper for 3 s), a failure is remembered for 30 s; driver and helper
+  replies are framed (glued or stray replies no longer shift later
+  answers out of step); stream mode 1 uses frame prefetch too; a slow
+  driver command is no longer sent twice by the helper.
+- The first-layer check is skipped, not the print aborted, when the helper
+  or the driver fails; nothing is learned outside a running print, and the
+  print hooks only act in file prints (`_LIDAR_PRINT_SCAN`,
+  `_LIDAR_PRINT_END`, `_LIDAR_FLOW_APPLY` check `print_stats.state`).
+- `LIDAR_GRID_CALIBRATE` / `LIDAR_TWIST_CALIBRATE` restore the bed heater
+  after a failed touch; scans restore the G-code state and switch the laser
+  off when their setup fails.
+- Bad G-code parameters end as command errors (no Klipper shutdown);
+  `MESH_BENCHMARK` checks every method (and `TRUTH`) before the first runs.
+- Driver: survives termios errors (USB re-enumeration), re-initialises and
+  restores laser, stream, level, exposure, gain and switches the fill light
+  off; HTTP camera clients run in threads (an idle client no longer blocks
+  LiDAR requests); a lost prefetch frame is retried.
+- Helper: LiDAR PA strips belong to their calibration job (never reused
+  from an earlier one), at most 16 scans in memory, frames get no reply,
+  names stay inside the data folder; the install scripts copy every helper
+  module (`lidar_bands.py`) and check them.
+
+### Upgrading
+- Helper: re-run `helper/install.sh` (or `host/install.sh --helper`).
+- Printer config: take `_LIDAR_PRINT_SCAN`, `_LIDAR_FLOW_APPLY`,
+  `_FIRST_LAYER_AFTER`, `_LIDAR_PRINT_END`, `_LIDAR_PRINT_CANCEL`,
+  `LIDAR_MESH_CALIBRATION`, `LIDAR_PA_CALIBRATION` and
+  `LIDAR_FLOW_CALIBRATION` from `lidar.example.cfg` again;
+  `k1max/lidar-k1max.cfg`'s `LIDAR_DRIVER` now passes `PARAMS=restart`.
+- Set your plate (`LIDAR_PLATE NAME=...`) before the next
+  `LIDAR_MESH_CALIBRATION`; existing runs stay untagged and are used until
+  the plate has its own.
+
 ## [0.4.0] - 2026-11-08
 
 The LiDAR's own camera: a webcam, pressure advance from photos of printed
@@ -266,7 +370,8 @@ First public release.
 - Helper service for a second computer, K1 Max boot script, protocol, pinout
   and install docs, offline tests with a fake module.
 
-[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.0...v0.3.1

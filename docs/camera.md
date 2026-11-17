@@ -6,8 +6,9 @@ pixel at scan height (Z3), a ~31 x 23 mm close-up next to the nozzle. Since
 0.4.0 FreeTheBeam uses it in three ways:
 
 1. a **webcam** for Fluidd/Mainsail (`lidar-direct.py --camera-port`),
-2. **`LIDAR_PA_FLOW_CALIBRATE`**: pressure advance (and, experimentally,
-   flow) from the width of printed lines,
+2. **`LIDAR_PA_FLOW_CALIBRATE`**: pressure advance from the width of
+   printed lines and (experimentally, since 0.5.0) flow from one-layer
+   bands,
 3. **`LIDAR_OFFSET_CALIBRATE`**: where the laser looks, from photos of a
    1-layer cross, checked against a LiDAR scan.
 
@@ -83,39 +84,63 @@ width follows the usable part of the line measured then.
 
 ## LIDAR_PA_FLOW_CALIBRATE
 
-One print, started like the old PA test (`LIDAR_PA_FLOW_CALIBRATION` macro,
-or `LIDAR_PA_CALIBRATE` when the camera is available):
+One print with PA lines and/or flow bands (since 0.5.0; 0.4.0 printed flow
+triplets and measured their width). Macros: `LIDAR_PA_CALIBRATION
+METHOD=IR|LIDAR|BOTH` (PA lines only; `LIDAR_PA_CALIBRATE` without the
+helper prints the LiDAR-only PA test) and `LIDAR_FLOW_CALIBRATION
+METHOD=BOTH|IR|LIDAR` (flow bands only); both in one print:
+`LIDAR_PA_FLOW_CALIBRATE TESTS=PA,FLOW PA_METHOD= FLOW_METHOD=`.
 
 1. Inside START_PRINT, after the mesh and nozzle touch and before the purge
    (`_LIDAR_PRINT_SCAN` -> `LIDAR_PA_FLOW_STEP STEP=BARE`): nozzle cooled to
    150 C, exposure for this plate, a plate photo (decides the photo exposure
-   and whether the LiDAR fallback is possible), 4 bare LiDAR strips under the
-   flow lines (their gap to the mesh).
-2. 4 groups of 90/100/110 % flow lines (1.5 mm apart, 50 mm long), then 9 PA
-   lines (PA_START + i * PA_STEP) with slow/fast segments.
-3. After a cool-down the camera photographs the speed changes and the flow
-   lines (`STEP=PHOTOS`), END_PRINT, then the helper analyses (`STEP=ANALYZE`,
-   report `pf-<job>.html` in the helper's data folder).
+   and whether the LiDAR fallback is possible), and the bare LiDAR strips:
+   one over the PA lines (`PA_METHOD=LIDAR|BOTH`, or a bright plate), one
+   per flow band (`FLOW_METHOD=LIDAR|BOTH`).
+2. 6 one-layer flow bands of 14 x 10 mm at 92..112 % (`FLOWS=`, lines along
+   Y at the slicer's spacing), then 9 PA lines (PA_START + i * PA_STEP) with
+   slow/fast segments.
+3. After a cool-down the camera photographs the speed changes and the bands
+   and the LiDAR scans the same strips again (`STEP=PHOTOS`), END_PRINT,
+   then the helper analyses (`STEP=ANALYZE`, report `pf-<job>.html` in the
+   helper's data folder).
 
-- **PA** comes from how the lines bulge after slowing down and thin after
-  speeding up: per line a score, a straight line through score vs PA crosses
-  zero at the right PA (needs >= 7 lines, r² >= 0.6, inside the tested
-  range). It is applied and saved (`lidar_pa`).
-- **Flow** comes from the width of the flow lines x the gap under them
-  (cross-section W*h - (1-pi/4)*h², h = 0.2 mm + the group's gap from the
-  bare strips) against what was commanded. **Experimental, not saved by
-  default**: it is reported, and only `FLOW_SAVE=1` saves it per filament
-  (`lidar_flow`), which `_LIDAR_FLOW_APPLY` then applies as `M221` at print
-  start (corrected when the first-layer check later learns a different Z
-  offset for that filament). Keep the slicer's flow ratio at 1.0 for a
-  filament with a saved flow.
+- **PA** (camera, `IR`) comes from how the lines bulge after slowing down
+  and thin after speeding up: per line a score, a straight line through
+  score vs PA crosses zero at the right PA (needs >= 7 lines, r² >= 0.6,
+  inside the tested range). `LIDAR` reads the same from the lines'
+  cross-sections in the strips (thin translucent lines read low, and on
+  black PEI the outer lines may fall outside the usable laser line). Saved
+  as `lidar_pa`.
+- **Flow (experimental)**: too little flow leaves gaps and a ridge pattern
+  at the line spacing; the flow is the first band that is closed and
+  smooth. Camera: per band photo (exposure 1000) the dark gaps and the
+  ridge pattern; the first band with gaps <= 0.05 % and pattern <= 5.5 % (the
+  rule picked the 104 % judged best by eye on the K1 Max; one run so far).
+  LiDAR: per band thickness (after - before, only reported: thin white lines
+  read low), roughness and gaps; provisional rule (no real band scans yet):
+  the first band within 25 % of the way from the smoothest to the roughest
+  band. Nothing is saved when the lowest band already passes or none does.
+  Saved per filament (`lidar_flow`), applied by `_LIDAR_FLOW_APPLY` as
+  `M221` at print start; keep the slicer's flow ratio at 1.0 for it.
+- **Benchmark** (`BOTH`, the default for flow): both methods are measured
+  and reported, nothing is saved, and Fluidd/Mainsail show a prompt with
+  `LIDAR_PA_SAVE METHOD=IR|LIDAR` / `LIDAR_FLOW_SAVE METHOD=IR|LIDAR`
+  buttons (also typed; the choice is kept in `flow_benchmark.json` in the
+  plugin's data folder). The prompt comes back with what is still unsaved
+  and closes after one PA and one flow choice. A stale benchmark (a later
+  calibration saved directly, already saved, another filament) is refused
+  unless `FORCE=1`.
 - Without enough contrast the camera result is refused. On a bright plate
   (plate photo median > 60 grey levels) the bare step also scans the PA
   lines' area with the LiDAR, and the PA falls back to the LiDAR analysis.
-- Placement: plate X-14..X+24, Y-2..Y+187 around `X=`/`Y=` (nozzle); with the
-  laser's strips and photos the nozzle travels ~Y-15..Y+210. Without X/Y the
-  K1 Max spot (X100 Y35) is used where it fits, else everything is centred in
-  the travel; the console says where.
+- Placement: the console says which plate area to keep clear (K1 Max spot
+  X100 Y35: PA lines X86-124 Y33-157, flow bands X86-206 Y33-87). Without
+  X/Y the K1 Max spot is used where it fits (the print, the laser's strips
+  and photos), else everything is centred in the travel.
+- A cancelled calibration print (`_LIDAR_PRINT_CANCEL`) puts the saved PA
+  (or the config's) and M221 S100 back.
+- Not in local mode (the service on the printer itself has no numpy).
 
 ### Results on the development printer (K1 Max, 2026-11-08)
 
@@ -149,16 +174,18 @@ The LiDAR fit of the 1-layer cross accepts a cross that reads low (~0.08 of
 LiDAR-measured value; the LiDAR's own point cloud of a printed line
 confirmed the same ~0.5 mm (camera mapping and LiDAR within 0.09 mm).
 
-## Known limitations (0.4.0)
+## Known limitations (0.5.0)
 
 - Tested on one K1 Max, one plate and one filament (white matte PLA on black
   smooth PEI).
-- Camera flow is ~4 % low against a printed check: opt-in only.
+- Flow: the 0.4.0 width method read ~4 % low against a printed check; the
+  band rule (0.5.0) is set from one run and sits on its edge at exposure
+  2000; the LiDAR band rule is provisional (no real band scans yet). Flow is
+  a benchmark by default.
 - The camera analysis assumes the K1 Max mounting (`x_dir: -1`).
 - Deferred review points, not fixed yet: stop-mode `LIDAR_SCAN` measures the
   exposure before moving to the scan XY; `LIDAR_PA_FLOW_STEP` PHOTOS/ANALYZE
   don't refuse when BARE never ran; the first-layer strip width assumes the
   usable line is centred; the LiDAR PA fallback hides its reason and accepts
-  4 lines / r² 0.5; old plain-number `lidar_flow` entries aren't clamped;
-  `FLOWS=` isn't validated; an error in a step aborts the print without
-  END_PRINT.
+  4 lines / r² 0.5; old plain-number `lidar_flow` entries aren't clamped; an
+  error in a step aborts the print without END_PRINT.

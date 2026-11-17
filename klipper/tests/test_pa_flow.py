@@ -383,8 +383,9 @@ class GenericTests(unittest.TestCase):
 
     def test_pa_calibrate_lidar_print_without_helper(self):
         # no helper, or the service on the printer itself (no numpy)
-        for service in (None, "127.0.0.1:7131", "localhost:7131"):
+        for service in (None, "127.0.0.1:7131"):
             L = make(service=service)
+            L.service_local = True
             called = []
             L._pa_lidar_print = lambda gcmd: called.append(gcmd)
             L.cmd_LIDAR_PA_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
@@ -420,9 +421,9 @@ class GenericTests(unittest.TestCase):
         L._offset_lidar = lambda gcmd: called.append("lidar")
         L._offset_camera = lambda gcmd: called.append("camera")
         L.cmd_LIDAR_OFFSET_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
-        L.service = "127.0.0.1:7131"           # local mode: no numpy
+        L.service, L.service_local = "127.0.0.1:7131", True   # no numpy
         L.cmd_LIDAR_OFFSET_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
-        L.service = "HELPER_IP:7131"
+        L.service, L.service_local = "127.0.0.1:7132", False  # host helper
         L.cmd_LIDAR_OFFSET_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
         self.assertEqual(called, ["lidar", "lidar", "camera"])
 

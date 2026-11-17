@@ -27,19 +27,20 @@ and LiDAR-measured calibrations.
   30x30 fitted to nozzle touches. On the development printer it is as
   accurate as the Microprobe (18.3 vs 18.9 µm rms against 36 nozzle touches)
   and 8-20x faster. Calibrated against the nozzle for X-beam twist and the
-  error along Y, with automatic probe fallback inside START_PRINT.
-  [Details](docs/bed-mesh.md).
+  error along Y (calibration runs kept per build plate, `LIDAR_PLATE`), with
+  automatic probe fallback inside START_PRINT. [Details](docs/bed-mesh.md).
 - **First-layer check** (`FIRST_LAYER_SCAN`). Scans the bare plate before
   the print and the first layer at layer 2, and reports the real thickness
-  map (test print: 0.194 mm measured for 0.200 mm sliced). It can learn the
-  Z offset per filament. [Details](docs/first-layer.md).
+  map (test print: 0.194 mm measured for 0.200 mm sliced), then primes the
+  oozed nozzle before printing on. It can learn the Z offset per filament.
+  [Details](docs/first-layer.md).
 - **The module's camera** (since 0.4.0, with the helper). Pressure advance
   from photos of printed lines (`LIDAR_PA_FLOW_CALIBRATE`; the LiDAR reads
   thin translucent lines low, the camera measures their width to a few µm),
   the laser offset from photos of a 1-layer cross, and a webcam for
-  Fluidd/Mainsail. Flow from the same print is experimental (read ~4 % low
-  against a printed check) and only saved on request.
-  [Details](docs/camera.md).
+  Fluidd/Mainsail. Flow from one-layer bands (since 0.5.0) is experimental:
+  by default a benchmark of camera and LiDAR, nothing saved until you pick
+  one. [Details](docs/camera.md).
 - **Calibrations**: pressure advance measured from a printed test, the
   LiDAR's own position, XY skew without calipers, frame timing; the
   exposure follows the plate (dark or glossy sheets need more light).
@@ -49,7 +50,9 @@ and LiDAR-measured calibrations.
   probe and the LiDAR against the same nozzle touches.
 - **Helper service** (`helper/`). Runs captures and analysis on a second
   computer (e.g. a Raspberry Pi), so the K1's ~200 MB of RAM stay with
-  Klipper.
+  Klipper. Without one it can run on the K1 itself (local mode, since 0.5.0:
+  everything but the camera and flow-band calibrations;
+  [details](docs/install-helper.md#on-the-printer-itself-local-mode)).
 - **Documentation** of the protocol, the timing and the hardware, with
   unknowns marked as unknown.
 
@@ -117,8 +120,9 @@ the scanned area clear, and do not run heavy analysis on the K1 itself.
 
 - Developed and tested on **one** K1 Max (glass bed, textured PEI; the
   camera calibrations on black smooth PEI with white matte PLA only).
-- Camera flow is experimental (~4 % low against a printed check), and the
-  camera analysis assumes the K1 Max's module mounting.
+- Flow is experimental (the band rules are set from one run, the LiDAR's is
+  provisional), and the camera analysis assumes the K1 Max's module
+  mounting.
 - The connector pinout is not measured yet ([pinout.md](docs/pinout.md) says
   how to help).
 - The LiDAR reads thin translucent lines and single layers low (the laser

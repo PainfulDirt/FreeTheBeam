@@ -15,8 +15,12 @@ development printer: 0.194 mm measured for 0.200 mm sliced.
 2. **After** (`PHASE=after`, from the slicer's layer-change G-code at layer 2,
    or `FINAL=1` from END_PRINT for one-layer prints): the print pauses,
    retracts, lets the nozzle cool by 30 °C (no ooze on the part), scans the
-   same strips and rows, heats up, lays a short prime line 8 mm in front of
-   the objects and resumes.
+   same strips and rows, heats up, refills the oozed tip (`TIP=`, default 5
+   mm), lays a purge line (`PRIME=`, default 20 mm; like the start purge,
+   `_KAMP_Settings` height and flow if present) in front of the objects, or
+   beside or behind them when the front has no room, and resumes
+   (`_FIRST_LAYER_AFTER`'s `prime_tip` / `prime_purge`; 0 and 0 = no prime).
+   If the helper or the driver fails, the print goes on without the check.
 3. **Analysis** on the helper (`fl_analyze`): the thickness map (2 mm cells),
    median, p05-p95, tilt in X and Y, the plate drift between the two scans
    from the bare parts, and a value per object. Reported in the console, and

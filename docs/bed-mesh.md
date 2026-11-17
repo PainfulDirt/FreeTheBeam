@@ -61,8 +61,17 @@ temperature.
 Every run is stored with its bed temperature in `lidar_cal_by_temp`; meshes
 use the mean of all runs on a hot (≥ 45 °C) or cold bed. Grids at 60, 70 and
 100 °C agreed within the run-to-run scatter (10-14 µm), so more runs give
-better tables. `RESET=1` forgets the stored runs: do that after changing the
-plate, the LiDAR mount or the gantry.
+better tables. Runs are tagged with the plate on the bed (`LIDAR_PLATE
+NAME=smooth_pei`, since 0.5.0) and meshes use only the current plate's runs
+(untagged older runs where the plate has none, other plates' never): set the
+plate before calibrating a new one; `LIDAR_PLATE` alone lists the plates and
+their runs. `RESET=1` forgets the current plate's runs and the untagged ones
+(all of them when no plate is set): do that after changing the LiDAR mount or
+the gantry.
+
+A moving column (levels 1-3) that got too few frames, e.g. after a lost
+frame on USB or Wi-Fi, is scanned again (at most 2 columns, fewer than 30 %
+of the median column's frames) before the mesh is made.
 
 ## Measured accuracy
 

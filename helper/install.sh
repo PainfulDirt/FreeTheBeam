@@ -9,11 +9,16 @@ if [ -z "$1" ]; then
 fi
 R=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p /opt/k1-lidar /var/lib/k1-lidar
-cp "$R/klipper/lidar.py" "$R/helper/lidar_service.py" \
-    "$R/helper/lidar_camera.py" "$R/helper/lidar_pa_flow.py" /opt/k1-lidar/
-# the camera calibrations' photo analysis (numpy + PIL)
+# the service, the camera/PA/flow modules it imports and the shared analysis
+cp "$R/klipper/lidar.py" "$R"/helper/lidar_*.py /opt/k1-lidar/
+for m in lidar.py lidar_service.py lidar_camera.py lidar_pa_flow.py \
+        lidar_bands.py; do
+    [ -f "/opt/k1-lidar/$m" ] || { echo "install.sh: missing /opt/k1-lidar/$m" >&2; exit 1; }
+done
+# the camera calibrations and the PA / flow analysis (numpy + PIL)
 python3 -c "import numpy, PIL" 2> /dev/null || echo "install.sh: the camera" \
-    "calibrations need numpy and PIL: apt install python3-numpy python3-pil" >&2
+    "and flow calibrations need numpy and PIL: apt install python3-numpy" \
+    "python3-pil (scans and meshes work without them)" >&2
 sed "s/PRINTER_IP/$1/g" "$R/helper/k1-lidar.service" > /etc/systemd/system/k1-lidar.service
 systemctl daemon-reload
 systemctl enable k1-lidar

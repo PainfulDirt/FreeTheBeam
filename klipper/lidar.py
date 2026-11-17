@@ -2180,10 +2180,13 @@ class Lidar:
         # optional helper computer running lidar_service.py ("host:port"):
         # the LiDAR captures and the analysis happen there, the K1 only
         # moves the toolhead and forwards bytes (lidar-bridge.py).
-        # 127.0.0.1 / localhost = the service on the printer itself (no
-        # helper computer; numpy-free work only): its analysis timeouts are
-        # scaled (svc_local, _svc_timeout)
+        # service_local: True = the service runs on the printer itself
+        # (no helper computer, no numpy; the K1 Max's lidar-start.sh starts
+        # it): camera and flow-band work refused, analysis timeouts scaled
+        # (svc_local, _svc_timeout). A helper with numpy on the same host
+        # (host/install.sh --helper) is not local in this sense.
         self.service = config.get("service", None)
+        self.service_local = config.getboolean("service_local", False)
         self.svc_sock = None
         self.svc_buf = b""
         self.svc_down = None    # (until, why) after a failed connect
@@ -2542,11 +2545,13 @@ class Lidar:
                          len(self.svc_buf))
             self.svc_buf = b""
 
+    service_local = False   # [lidar] service_local (objects built in tests)
+
     @property
     def svc_local(self):
-        """The service runs on this printer (service: 127.0.0.1:port)."""
-        return bool(self.service) and self.service.rsplit(":", 1)[0] in (
-            "127.0.0.1", "localhost")
+        """The service runs on this printer without numpy ([lidar]
+        service_local: True, e.g. the K1 Max without a helper computer)."""
+        return bool(self.service) and bool(self.service_local)
 
     SVC_LOCAL_MAX = 300.0
 
@@ -2792,7 +2797,9 @@ class Lidar:
         else:
             try:
                 self._svc({"cmd": "ping"})
-                out.append(("service", True, "answers at " + self.service))
+                out.append(("service", True, "answers at %s%s" % (
+                    self.service, " (local mode on this printer: no camera"
+                    " or flow-band calibrations)" if self.svc_local else "")))
             except err as e:
                 out.append(("service", False, "%s: no answer (%s)"
                             % (self.service, e)))
@@ -2831,13 +2838,15 @@ class Lidar:
                         " need it)" % (mode, e)))
         if self._camera_ok():
             out.append(("camera", True, "camera calibrations on (PA/flow"
-                        " print, offset cross; flow only saved with"
-                        " FLOW_SAVE=1)"))
+                        " print, offset cross; flow experimental: a"
+                        " benchmark unless FLOW_METHOD=IR|LIDAR)"))
         else:
             out.append(("camera", False, "camera calibrations off (%s):"
                         " LIDAR_PA_CALIBRATE and LIDAR_OFFSET_CALIBRATE use"
                         " the LiDAR alone" % (
                             "no helper service" if not self.service else
+                            "the service runs on the printer"
+                            " (service_local)" if self.svc_local else
                             "[lidar] camera: False" if self.x_dir < 0 else
                             "x_dir is not -1, the photo analysis assumes"
                             " the K1 Max mounting")))
@@ -3726,7 +3735,7 @@ class Lidar:
 
     # the five levels: (name, grid, continuous speed mm/s, dwell grid,
     # frames per point, dwell speed); 4 and 5 scan whole strips. Times and
-    # accuracy: k1-lidar/bedmesh/study_levels.py
+    # accuracy on the K1 Max: docs/bed-mesh.md
     LEVELS = {
         1: ("quick", 7, 150.0, 7, 1, 300.0),
         2: ("fast", 12, 120.0, 12, 1, 200.0),
@@ -5153,12 +5162,20 @@ class Lidar:
         st = th.get_status(self.reactor.monotonic())
         was = [st.get(k) for k in ("max_velocity", "max_accel",
                                    "square_corner_velocity")]
+        # (Simple AF: _START_END_PARAMS; else the [printer] section's)
         sp = self.printer.lookup_object("gcode_macro _START_END_PARAMS", None)
         sv = getattr(sp, "variables", None) or {}
         fast = None
         if None not in was:
-            fast = (max(was[0], float(sv.get("start_max_velocity", 400.0))),
-                    max(was[1], float(sv.get("start_max_accel", 10000.0))))
+            pc = {}
+            cf = self.printer.lookup_object("configfile", None)
+            if cf is not None:
+                pc = cf.get_status(self.reactor.monotonic()).get(
+                    "settings", {}).get("printer", {})
+            fast = (max(was[0], float(sv.get("start_max_velocity", pc.get(
+                        "max_velocity", was[0])))),
+                    max(was[1], float(sv.get("start_max_accel", pc.get(
+                        "max_accel", was[1])))))
             if fast == tuple(was[:2]):
                 fast = None
         run("SAVE_GCODE_STATE NAME=_fl_after")

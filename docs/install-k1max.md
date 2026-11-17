@@ -56,13 +56,14 @@ the path in `[gcode_shell_command k1_lidar_start]`) and what you need from
 |---|---|---|
 | START_PRINT, first thing (`_SAF_START_PRINT_START`) | `_LIDAR_PRINT_START` | first-layer check |
 | START_PRINT, instead of `BED_MESH_CALIBRATE` (`_START_PRINT_BED_MESH`) | `_LIDAR_START_PRINT_MESH ADAPTIVE=1` | LiDAR mesh with the `LiDAR_Mesh` switch |
-| START_PRINT, after the mesh and the nozzle touch (`_SAF_START_PRINT_AFTER_BED_MESH`) | `_FIRST_LAYER_OFFSET {rawparams}`, `_LIDAR_FLOW_APPLY {rawparams}`, then `_LIDAR_PRINT_SCAN {rawparams}` | learned Z offset, saved flow (experimental, `FLOW_SAVE=1`), PA and PA/flow tests, first-layer check |
+| START_PRINT, after the mesh and the nozzle touch (`_SAF_START_PRINT_AFTER_BED_MESH`) | `_FIRST_LAYER_OFFSET {rawparams}`, `_LIDAR_FLOW_APPLY {rawparams}`, then `_LIDAR_PRINT_SCAN {rawparams}` | learned Z offset, saved flow (experimental), PA and flow calibration prints, first-layer check |
 | slicer layer change, layer 2 | `_FIRST_LAYER_AFTER` | first-layer check |
 | END_PRINT, before moving away (`_SAF_END_PRINT_START`) | `_LIDAR_PRINT_END` | first-layer check of one-layer prints |
-| CANCEL_PRINT (`_SAF_ON_CANCEL`) | `_LIDAR_PRINT_CANCEL` | first-layer check |
+| CANCEL_PRINT (`_SAF_ON_CANCEL`) | `_LIDAR_PRINT_CANCEL` | first-layer check; PA and M221 back after a cancelled calibration print |
 
 Only add the lines for the features you use. `LIDAR_PA_CALIBRATION` and
-`LIDAR_PA_FLOW_CALIBRATION` need `_LIDAR_PRINT_SCAN`. The driver serves the
+`LIDAR_FLOW_CALIBRATION` need `_LIDAR_PRINT_SCAN`. No helper computer: the
+service can run on the K1 itself ([install-helper.md](install-helper.md#on-the-printer-itself-local-mode)). The driver serves the
 LiDAR's camera on port 8081 while the `LiDAR_Camera` switch is on; how to
 add it to Fluidd and the camera calibrations: [camera.md](camera.md).
 
@@ -73,7 +74,8 @@ add it to Fluidd and the camera calibrations: [camera.md](camera.md).
    switching driver).
 3. `LIDAR_OFFSET_CALIBRATION`: prints a small cross and saves where the laser
    looks. Repeat after any change of plate or mount.
-4. With the helper and load cells: `LIDAR_SETUP_CHECK`, then `LIDAR_MESH_CALIBRATION` (clear plate,
+4. With the helper and load cells: `LIDAR_SETUP_CHECK`, `LIDAR_PLATE NAME=<plate>`
+   (e.g. `textured_pei`), then `LIDAR_MESH_CALIBRATION` (clear plate,
    bed at print temperature), then `LIDAR_MESH` to try a mesh and
    `MESH_COMPARE A=lidar B=<your probe profile>` to compare it. Switch on
    `LiDAR_Mesh` once you trust it.
