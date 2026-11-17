@@ -53,6 +53,13 @@ whole-codebase bug hunt.
   and local service (TERM, KILL after 5 s) and starts them again.
 - `_LIDAR_PRINT_CANCEL` puts PA (saved or config) and M221 S100 back after a
   cancelled calibration print.
+- **`FIRST_LAYER_BIAS [VALUE=] [CLEAR=1] [PLATE=] [FILAMENT=]`**: the
+  first-layer check's LiDAR bias per plate and filament (`fl_bias`), taken
+  off before the check reports or learns (white PLA on black smooth PEI read
+  ~37 µm low against a contact probe).
+  [first-layer.md](docs/first-layer.md#lidar-bias-per-platefilament)
+- `LIDAR_STATUS SELFTEST=1` says when a failed self test ran far above the
+  plate (the laser reads weak from there): run it at scan height.
 
 ### Changed
 - `LIDAR_PA_CALIBRATE` with the helper prints only the PA lines

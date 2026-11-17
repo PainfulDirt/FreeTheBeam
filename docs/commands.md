@@ -13,7 +13,7 @@ see [install-helper.md](install-helper.md)); *touch* = a touch method
 
 | Command | What it does | Needs |
 |---|---|---|
-| `LIDAR_STATUS [SELFTEST=1] [AMBIENT=1]` | Checks that the driver answers; prints the module's firmware, serial and temperature, the version, offsets, where the work runs (helper, the service on the printer itself, or the plugin), the scans in memory and the plate (`LIDAR_PLATE`; a warning when it has no calibration runs). `SELFTEST=1`: the module's laser/fill-light brightness test. `AMBIENT=1`: points found with the laser off (room light read as a line). | |
+| `LIDAR_STATUS [SELFTEST=1] [AMBIENT=1]` | Checks that the driver answers; prints the module's firmware, serial and temperature, the version, offsets, where the work runs (helper, the service on the printer itself, or the plugin), the scans in memory and the plate (`LIDAR_PLATE`; a warning when it has no calibration runs). `SELFTEST=1`: the module's laser/fill-light brightness test (run it at scan height over the plate: from far above, the laser reads weak; a failed test says so). `AMBIENT=1`: points found with the laser off (room light read as a line). | |
 | `LIDAR_STREAM_MODE [MODE=0\|1]` | `MODE=1`: the module captures continuously (~10.7 instead of ~5 frames/s, frames ~0.1 s older); saved as `lidar_stream_mode`, each mode has its own `LIDAR_TIMING`. Not the default: on the K1 Max dwell scans got only ~15 % faster and meshes ~12 µm rms noisier. | lidar-direct.py 0.4.0 |
 | `LIDAR_SETUP_CHECK` | What this printer's setup can do: driver, offsets measured or not, timing, service, the area the LiDAR reaches (levels 1-3 and 4-5), `zero_reference_position`, the touch method, skew/keep-out; ends with what is missing. | |
 | `LIDAR_TIMING [Z=3] [DZ=1.5] [SPEED=5] [CYCLES=15] [LEVELS=0,1] [APPLY=1]` | Measures the frame period and the time window a frame covers (slow Z moves over a flat plate) and saves them as `lidar_timing` for dwell scans. Run once per driver. | service, homed |
@@ -44,6 +44,7 @@ See [first-layer.md](first-layer.md).
 | Command | What it does | Needs |
 |---|---|---|
 | `FIRST_LAYER_SCAN PHASE=before\|after\|cancel` | `before`: scans the bare plate under the print's objects. `after` (at layer 2, or `FINAL=1` from END_PRINT): pauses, scans the same rows, reports the real first-layer thickness, then primes the nozzle (`TIP=5` mm to refill it, a `PRIME=20` mm purge line in front of the objects, else beside or behind them; `TIP=0 PRIME=0` = none) and resumes. The fitted line ramp is kept per filament (`fl_line_ramp`) for parts too small to fit it. `cancel`: forgets the pending check. When the helper or the driver fails the print goes on without the check. | service, `[exclude_object]` |
+| `FIRST_LAYER_BIAS [VALUE=] [CLEAR=1] [PLATE=] [FILAMENT=]` | The first-layer check's LiDAR bias (LiDAR minus true height, mm, at most ±0.15) per plate and filament, taken off before the check reports or learns ([first-layer.md](first-layer.md#lidar-bias-per-platefilament)). `VALUE=` sets it for the current plate (`LIDAR_PLATE`) and the last filament (`last_filament_name`), `PLATE=` / `FILAMENT=` choose others, `CLEAR=1` removes it, no parameters: lists all. | a plate set |
 
 ## Calibration prints
 
@@ -108,6 +109,7 @@ Full list with comments: [`config/generic.cfg`](../config/generic.cfg).
 | `lidar_stream_mode` | `LIDAR_STREAM_MODE` |
 | `sw_lidar_camera` | the `LiDAR_Camera` switch |
 | `fl_zoffset` | the first-layer check with `First_Layer_Learn` on |
+| `fl_bias` | `FIRST_LAYER_BIAS` |
 
 Every run of `LIDAR_BED_MESH`, `LIDAR_TWIST_CALIBRATE`, `LIDAR_GRID_CALIBRATE`,
 `LIDAR_TIMING`, `LIDAR_OFFSET_CALIBRATE`, `MESH_BENCHMARK` and

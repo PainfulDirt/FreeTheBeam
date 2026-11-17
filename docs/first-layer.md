@@ -46,6 +46,21 @@ at the next start. A check counts as clean with at least 100 cells, a p05-p95
 spread of ≤ 0.15 mm, an error of ≤ 0.15 mm and a bare-plate drift of
 ≤ 30 µm rms.
 
+## LiDAR bias per plate/filament
+
+The LiDAR doesn't read every filament on every plate at its true height:
+white PLA on black smooth PEI read ~37 µm low against a contact probe on 9
+pads (the check said 0.166 mm for a fine 0.200 mm layer), probably because
+the laser shines into the translucent plastic. Such a bias would also be
+learned into the Z offset. To measure it, print a few one-layer pads, probe
+each pad and the bare plate beside it (pad minus plate = true height) and
+compare with a `LIDAR_SCAN` (or the check's own reading) of the same pads.
+Then save LiDAR minus true height for the current plate (`LIDAR_PLATE`) and
+filament, e.g. `FIRST_LAYER_BIAS VALUE=-0.037`; the check takes it off
+before it reports or learns and says so in the console ("LiDAR bias ...
+taken off"). `FIRST_LAYER_BIAS` alone lists the values, `CLEAR=1` removes
+one.
+
 ## Setup
 
 1. Helper service running and `service:` set in `[lidar]`.

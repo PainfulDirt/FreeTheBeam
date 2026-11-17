@@ -160,6 +160,9 @@
 #       mesh off during both scans. First_Layer_Learn: half the error per
 #       print (max 0.03mm per print, 0.15mm total) becomes the filament's Z
 #       offset (fl_zoffset), set by _FIRST_LAYER_OFFSET at the next start
+#   FIRST_LAYER_BIAS [VALUE=] [CLEAR=1] [PLATE=] [FILAMENT=]
+#       the first-layer check's LiDAR bias (LiDAR minus true height, mm) per
+#       plate and filament (fl_bias), taken off before it reports or learns
 #
 # Copy or symlink into klippy/plugins (see docs/install-k1max.md).
 # Part of FreeTheBeam, https://github.com/PainfulDirt/FreeTheBeam
@@ -2206,7 +2209,8 @@ class Lidar:
                     "FIRST_LAYER_SCAN", "SKEW_SCAN", "SKEW_CALIBRATE",
                     "LIDAR_SETUP_CHECK", "LIDAR_STREAM_MODE",
                     "LIDAR_PA_FLOW_CALIBRATE", "LIDAR_PA_FLOW_STEP",
-                    "LIDAR_FLOW_SAVE", "LIDAR_PA_SAVE", "LIDAR_PLATE"):
+                    "LIDAR_FLOW_SAVE", "LIDAR_PA_SAVE", "LIDAR_PLATE",
+                    "FIRST_LAYER_BIAS"):
             fn = self._keyed(cmd, getattr(self, "cmd_" + cmd))
             if cmd in self.TEMP_LOGGED:
                 fn = self._temp_logged(cmd, fn)
@@ -2714,6 +2718,16 @@ class Lidar:
                          " temperature); SELFTEST=1 laser/light brightness"
                          " test, AMBIENT=1 points found with the laser off")
 
+    @staticmethod
+    def _selftest_hint(z, scan_z):
+        """The self test reads the laser line's brightness where it is: far
+        above the plate it says "weak" (Z20 weak, Z3 ok on a K1 Max)."""
+        if z > scan_z + 3.0:
+            return (" - the toolhead is at Z%.0f: run it at scan height Z%.0f"
+                    " over the plate (from far away the laser reads weak)"
+                    % (z, scan_z))
+        return ""
+
     def cmd_LIDAR_STATUS(self, gcmd):
         r = self._driver_msg({"control": "get_laser_exposure"})
         try:
@@ -2739,11 +2753,14 @@ class Lidar:
                         t["fps"], t["alg_op_ms"], t["alg_ms"], t["wait_ms"]))
         if gcmd.get_int("SELFTEST", 0):
             t = self._driver_msg({"control": "self_test"}, 15.0)
+            z = self.printer.lookup_object("toolhead").get_position()[2]
             gcmd.respond_info(
-                "LiDAR self test: %s (laser %s, light %s, code %s)" % (
+                "LiDAR self test: %s (laser %s, light %s, code %s)%s" % (
                     "ok" if t.get("self_test") == 0 else "FAILED",
                     "ok" if t.get("laser_ok") else "weak",
-                    "ok" if t.get("light_ok") else "weak", t.get("self_test")))
+                    "ok" if t.get("light_ok") else "weak", t.get("self_test"),
+                    "" if t.get("self_test") == 0
+                    else self._selftest_hint(z, self.scan_z)))
         if gcmd.get_int("AMBIENT", 0):
             a = self._driver_msg({"control": "ambient_points"}, 15.0)
             pts = a.get("points") or []
@@ -5237,8 +5254,8 @@ class Lidar:
         return res
 
     def _fl_key(self, fl):
-        name = fl.get("filament_name") or fl.get("filament") or "unknown"
-        return name.replace(" ", "_").replace('"', "").replace("'", "")
+        return self._filament_key(
+            fl.get("filament_name") or fl.get("filament") or "unknown")
 
     def _fl_analyze(self, gcmd):
         fl = self.fl
@@ -5270,6 +5287,8 @@ class Lidar:
             gcmd.respond_info("First-layer check: no result (%s)"
                               % (res.get("reason"),))
             return res
+        plate = self._saved().get("lidar_plate")
+        bias = self._fl_apply_bias(res, plate, key)
         h = fl["height"]
         tl = res.get("tilt_um_per_100mm")
         gcmd.respond_info(
@@ -5283,6 +5302,10 @@ class Lidar:
                 ", curved by %.0f um (taken off)" % (
                     res["drift"]["bowl"] * 1000)
                 if res["drift"].get("surface") == "quadratic" else ""))
+        if bias is not None:
+            gcmd.respond_info(
+                "  LiDAR bias %+.3fmm for %s on %s taken off (read %.3fmm;"
+                " FIRST_LAYER_BIAS)" % (bias, key, plate, res["median_raw"]))
         for o in res["objects"][:6]:
             gcmd.respond_info("  %s: %.3fmm (%d cells)" % (
                 o["name"], o["median"], o["cells"]))
@@ -5313,6 +5336,79 @@ class Lidar:
         self.gcode.run_script_from_command(
             'SAVE_VARIABLE VARIABLE=fl_line_ramp VALUE="%s"' % (
                 repr(saved).replace(" ", ""),))
+
+    # what the LiDAR reads minus the true height (mm), per plate and filament:
+    # white PLA on black smooth PEI read ~37 um low (contact probe on 9 pads);
+    # taken off before the check reports or learns
+    FL_BIAS_MAX = 0.15
+
+    @staticmethod
+    def _filament_key(name):
+        return str(name).replace(" ", "_").replace('"', "").replace("'", "")
+
+    def _fl_bias_for(self, plate, key):
+        if not plate:
+            return None
+        v = ((self._saved().get("fl_bias") or {}).get(plate) or {}).get(key)
+        return None if v is None else float(v)
+
+    def _fl_apply_bias(self, res, plate, key):
+        """Take this plate's and filament's LiDAR bias off a check's result
+        (median, error, p05/p95, objects); the bias or None."""
+        b = self._fl_bias_for(plate, key) if res.get("ok") else None
+        if b is None:
+            return None
+        res["median_raw"] = res["median"]
+        for k in ("median", "error", "p05", "p95"):
+            if res.get(k) is not None:
+                res[k] = round(res[k] - b, 4)
+        for o in res.get("objects") or []:
+            o["median"] = round(o["median"] - b, 4)
+        res["bias"] = b
+        return b
+
+    desc_FIRST_LAYER_BIAS = (
+        "The first-layer check's LiDAR bias per plate and filament (LiDAR"
+        " minus true height, mm; white PLA on black PEI ~ -0.037): VALUE="
+        " sets it for the current plate and last filament (PLATE=,"
+        " FILAMENT= to choose), CLEAR=1 removes it, no parameters: list")
+
+    def cmd_FIRST_LAYER_BIAS(self, gcmd):
+        sv = self._saved()
+        table = dict((p, dict(f)) for p, f in
+                     (sv.get("fl_bias") or {}).items())
+        value = gcmd.get_float("VALUE", None)
+        clear = gcmd.get_int("CLEAR", 0)
+        if value is None and not clear:
+            rows = ["%s / %s: %+.3f mm" % (p, f, v) for p in sorted(table)
+                    for f, v in sorted(table[p].items())]
+            gcmd.respond_info("First-layer bias (LiDAR minus true height): %s"
+                              % ("; ".join(rows) if rows else "none set"))
+            return
+        plate = gcmd.get("PLATE", sv.get("lidar_plate"))
+        if not plate:
+            raise gcmd.error("FIRST_LAYER_BIAS: no plate set (LIDAR_PLATE"
+                             " NAME=... first, or PLATE=)")
+        key = self._filament_key(gcmd.get("FILAMENT", sv.get(
+            "last_filament_name") or ""))
+        if not key:
+            raise gcmd.error("FIRST_LAYER_BIAS: no filament (FILAMENT=)")
+        if clear:
+            table.get(plate, {}).pop(key, None)
+            if not table.get(plate):
+                table.pop(plate, None)
+            msg = "removed for %s / %s" % (plate, key)
+        else:
+            if abs(value) > self.FL_BIAS_MAX:
+                raise gcmd.error("FIRST_LAYER_BIAS: %.3f mm is implausible"
+                                 " (at most +-%.2f)" % (value,
+                                                        self.FL_BIAS_MAX))
+            table.setdefault(plate, {})[key] = round(value, 4)
+            msg = "%+.3f mm for %s / %s" % (value, plate, key)
+        self.gcode.run_script_from_command(
+            'SAVE_VARIABLE VARIABLE=fl_bias VALUE="%s"' % (
+                repr(table).replace(" ", ""),))
+        gcmd.respond_info("First-layer bias: " + msg)
 
     # learning: half the error per print, at most FL_STEP per print and
     # FL_MAX in total (mm), only from a clean measurement
