@@ -44,10 +44,6 @@ and LiDAR-measured calibrations.
 - **Calibrations**: pressure advance measured from a printed test, the
   LiDAR's own position, XY skew without calipers, frame timing; the
   exposure follows the plate (dark or glossy sheets need more light).
-- **K1 Max extras** (`k1max/k1max-extras.cfg`, `klipper/`): keep-out zones,
-  nozzle wipe on the plate edge, True Zero touch (Z=0 from a load-cell nozzle
-  touch, checked by the probe), and a twist calibration that measures the
-  probe and the LiDAR against the same nozzle touches.
 - **Helper service** (`helper/`). Runs captures and analysis on a second
   computer (e.g. a Raspberry Pi), so the K1's ~200 MB of RAM stay with
   Klipper. Without one it can run on the K1 itself (local mode, since 0.5.0:
@@ -77,7 +73,6 @@ nozzle-touch command. `LIDAR_SETUP_CHECK` shows what your setup can do.
 | Read profiles from the module on any Linux machine | `driver/` | [install-generic](docs/install-generic.md) |
 | Use the LiDAR on a K1 Max with Simple AF + Kalico | `driver/`, `klipper/`, `k1max/` | [install-k1max](docs/install-k1max.md) |
 | Mount the module on another Klipper printer | `host/`, `driver/`, `klipper/`, `config/` | [install-other-printer](docs/install-other-printer.md) |
-| Keep-out zones, nozzle wipe, True Zero touch, probe twist | `klipper/*.py`, `k1max/k1max-extras.cfg` | [install-k1max](docs/install-k1max.md#6-k1-max-extras-optional) |
 | Bed meshes, first-layer check, analysis | add `helper/` | [install-helper](docs/install-helper.md) |
 
 Quick start with only the module (no printer):

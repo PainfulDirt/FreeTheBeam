@@ -59,18 +59,6 @@ See [first-layer.md](first-layer.md).
 | `SKEW_SCAN NAME= ROT= [X0= Y0= X1= Y1=]` | Scans a printed square; scan it twice, turned ~90° between the scans. | service, homed |
 | `SKEW_CALIBRATE NAMES=a,b [APPLY=1]` | XY skew from two `SKEW_SCAN`s, without calipers; `APPLY=1` sets it via `[skew_correction]`. | service |
 
-## K1 Max extras
-
-From `klipper/keep_out.py`, `klipper/nozzle_wipe.py`, `klipper/twist_touch.py`
-(config in `k1max/k1max-extras.cfg`).
-
-| Command | What it does | Needs |
-|---|---|---|
-| `KEEP_OUT_STATUS` | Lists the keep-out zones. Moves into them are refused. | |
-| `NOZZLE_WIPE [TEMP=] [AFTER_TEMP=]` | Cleans the nozzle on the strip at the plate's back edge. | homed, load cells |
-| `NOZZLE_SCRUB` | Short wipe for `nozzle_scrubber_gcode` (bad taps), no touches. | a previous `NOZZLE_WIPE` |
-| `AXIS_TWIST_TOUCH_CALIBRATE` | Probe vs nozzle touch along X, saved as `[axis_twist_compensation]`; with the service the LiDAR's X table too. | homed, probe, load cells |
-
 ## Macros in `lidar.example.cfg`
 
 | Macro | Wraps |

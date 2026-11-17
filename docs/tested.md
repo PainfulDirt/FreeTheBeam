@@ -38,7 +38,6 @@ normal prints since then.
 | Flow bands, camera rule (0.5.0) | offline, on band photos of 2026-11-08 | picks 104 % at exposure 1000 (the band judged best by eye); at exposure 2000 the rule is on its edge and picks 108 % |
 | PA/flow benchmark (`BOTH`, 0.5.0) | 2026-11-12, one print | camera PA 0.0376 (not saved: the user kept 0.0361); the flow bands gave no result in that run. LiDAR band rule still provisional |
 | `SKEW_SCAN` / `SKEW_CALIBRATE` | 2026-10-30, in use | -0.20° (-0.35 mm per 100 mm), saved as skew profile `lidar` |
-| `AXIS_TWIST_TOUCH_CALIBRATE` (probe + LiDAR twist tables in one run) | 2026-10-29, 2026-11-01 | Probe and LiDAR see the X-beam twist with opposite signs; tables saved and used |
 | `LIDAR_TWIST_CALIBRATE AXIS=X/Y` | 2026-11-01 | Y error +22 ± 4 µm/100 mm (cold bed), confirmed by A/B prints |
 | `LIDAR_GRID_CALIBRATE` (`LIDAR_MESH_CALIBRATION GRID=7,5`) | 2026-11-01, at 60, 70 and 100 °C | Rest after the X and Y curves 11-13 µm rms; the three temperatures agree within run-to-run scatter |
 | `LIDAR_MESH_CALIBRATION` with the bed heater restored after a failed touch (0.5.0) | 2026-11-17, at 60 °C | ran through; X line to X269 |
@@ -67,14 +66,6 @@ normal prints since then.
 | Check skipped (not aborted) when the helper or the driver fails (0.5.0) | offline tests | |
 | Curved plate drift between the scans (0.3.1) | 2026-11-02, two 9-pad prints re-analysed | The bare plate between the pads showed a 40-60 um bowl; taken off as a quadratic surface the pads spread 6.1 / 7.5 um rms instead of 16.2 / 23.3, median 0.204 mm for 0.200 (a contact probe on the pads agreed); a strip-shift print ruled out the laser line itself |
 | `First_Layer_Learn` (Z offset per filament) | in use since 2026-10-31 | |
-
-## K1 Max extras (`k1max/k1max-extras.cfg`)
-
-| Feature | Tested | Result |
-|---|---|---|
-| Keep-out zones (`keep_out.py`) | in use | Probe kept off the Z rod housings; LiDAR scans planned around the zones |
-| Nozzle wipe (`NOZZLE_WIPE`, `NOZZLE_SCRUB`) | in use | Can leave a thin string on the side of the nozzle; the purge picks it up |
-| True Zero touch (load-cell Z=0, checked by the probe) | in use | |
 
 ## Not tested
 

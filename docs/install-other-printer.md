@@ -109,8 +109,7 @@ With the printer homed and the plate clear:
 - Cartesian and CoreXY only (the planning assumes X and Y move
   independently).
 - `mesh_min` / `mesh_max` keep meshes and calibrations clear of clips,
-  wipers or anything else on the bed edge; keep-out zones need
-  `keep_out.py` ([install-k1max.md](install-k1max.md#6-k1-max-extras-optional)).
+  wipers or anything else on the bed edge.
 - The LiDAR has no absolute height: meshes are made 0 at `[bed_mesh]
   zero_reference_position`, which must be where Z is homed or touched.
   **Set it**: without it LiDAR meshes are only made relative to their

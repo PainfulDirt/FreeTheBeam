@@ -47,9 +47,9 @@ the path in `[gcode_shell_command k1_lidar_start]`) and what you need from
 `[save_variables]` section.
 
 > Upgrading from 0.2.0: the K1 values moved out of the code into
-> `lidar-k1max.cfg`. Without `mesh_min`/`mesh_max`, `twist_y`/`ytwist_x` and
-> `touch_wipe_gcode`, meshes would use the whole travel (into the keep-out
-> zones at the back) and calibrations other lines. Then hook the LiDAR into your print macros
+> `lidar-k1max.cfg`. Without `mesh_min`/`mesh_max` and `twist_y`/`ytwist_x`,
+> meshes would use the whole travel (into the Z rod
+> housings at the back) and calibrations other lines. Then hook the LiDAR into your print macros
 (Simple AF names in brackets):
 
 | Where | Add | For |
@@ -80,32 +80,11 @@ add it to Fluidd and the camera calibrations: [camera.md](camera.md).
    `MESH_COMPARE A=lidar B=<your probe profile>` to compare it. Switch on
    `LiDAR_Mesh` once you trust it.
 
-## 6. K1 Max extras (optional)
+## 6. XY skew
 
-`k1max/k1max-extras.cfg` holds what the development printer uses around the
-LiDAR, all tested there ([tested.md](tested.md)):
-
-| Plugin / macro | Command | What |
-|---|---|---|
-| `klipper/keep_out.py`, `[keep_out]` | `KEEP_OUT_STATUS` | refuses moves into zones (e.g. where the probe hits the Z rod housings); lidar.py plans scans around them |
-| `klipper/nozzle_wipe.py`, `[nozzle_wipe]` | `NOZZLE_WIPE`, `NOZZLE_SCRUB` | nozzle cleaning on a strip at the plate's back edge, load-cell referenced; run before nozzle touches |
-| `_LOAD_CELL_TOUCH_Z` | | True Zero touch: Z=0 from a load-cell nozzle touch at the zero reference, checked by the probe, retried once after a wipe |
-| `klipper/twist_touch.py`, `[twist_touch]` | `AXIS_TWIST_TOUCH_CALIBRATE` | axis twist for the probe from nozzle touches instead of the paper test; with the LiDAR service also the LiDAR's X table in the same run |
-| `[skew_correction]`, `_SKEW_LOAD` | | loads the skew profile saved by `SKEW_CALIBRATE` at boot |
-
-Link the three plugins like `lidar.py`:
-
-```
-for f in keep_out nozzle_wipe twist_touch; do
-  ln -sf /usr/data/FreeTheBeam/klipper/$f.py /usr/data/klipper/klippy/plugins/$f.py
-done
-```
-
-They need a Microprobe-style `[probe]` and Kalico's `[load_cell_probe]`.
-**The zones and the wipe strip are measured on one printer**: check them on
-yours (`KEEP_OUT_STATUS`, and watch the first wipe) before relying on them.
-For Kalico's bad-tap handling set `nozzle_scrubber_gcode: NOZZLE_SCRUB` in
-`[load_cell_probe]`.
+`SKEW_CALIBRATE ... APPLY=1` needs a `[skew_correction]` section. Klipper
+doesn't load a saved skew profile at boot by itself; a `delayed_gcode` with
+`SKEW_PROFILE LOAD=<name>` does.
 
 ## Things to avoid
 

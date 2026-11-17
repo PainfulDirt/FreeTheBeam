@@ -7,7 +7,7 @@ between minor versions).
 
 ## [Unreleased]
 
-## [0.5.0] - unreleased
+## [0.5.0] - 2026-11-17
 
 Brings FreeTheBeam up to the development K1 Max's state of 2026-11-17: flow
 from one-layer bands, camera-vs-LiDAR benchmarks, calibration runs per build
@@ -100,6 +100,18 @@ whole-codebase bug hunt.
   names stay inside the data folder; the install scripts copy every helper
   module (`lidar_bands.py`) and check them.
 
+### Removed
+- **FreeTheBeam is about the LiDAR only**: `klipper/keep_out.py`,
+  `klipper/nozzle_wipe.py`, `klipper/twist_touch.py` and
+  `k1max/k1max-extras.cfg` are gone (printer-specific extras, not LiDAR:
+  keep-out zones, `NOZZLE_WIPE`/`NOZZLE_SCRUB`, True Zero touch,
+  `AXIS_TWIST_TOUCH_CALIBRATE`, skew profile loading). Users who want them
+  keep their 0.4.0 copies; `lidar.py` still plans around a `[keep_out]`
+  object if one is loaded, and `[lidar] touch_wipe_gcode` can name any
+  cleaning macro. `k1max/lidar-k1max.cfg` no longer sets
+  `touch_wipe_gcode: _TOUCH_NOZZLE_WIPE`; the `_LIDAR_SWITCHES` map no
+  longer lists `True_Zero_Touch` and `Nozzle_Deep_Clean`.
+
 ### Upgrading
 - Helper: re-run `helper/install.sh` (or `host/install.sh --helper`).
 - Printer config: take `_LIDAR_PRINT_SCAN`, `_LIDAR_FLOW_APPLY`,
@@ -110,6 +122,10 @@ whole-codebase bug hunt.
 - Set your plate (`LIDAR_PLATE NAME=...`) before the next
   `LIDAR_MESH_CALIBRATION`; existing runs stay untagged and are used until
   the plate has its own.
+- Using the 0.4.0 extras: keep linking your 0.4.0 `keep_out.py`,
+  `nozzle_wipe.py`, `twist_touch.py` and including your copy of
+  `k1max-extras.cfg`; set `touch_wipe_gcode: _TOUCH_NOZZLE_WIPE` in your
+  `[lidar]` again and add the two switches back to `_LIDAR_SWITCHES`.
 
 ## [0.4.0] - 2026-11-08
 

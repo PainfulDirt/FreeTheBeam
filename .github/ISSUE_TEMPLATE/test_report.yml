@@ -25,7 +25,6 @@ body:
         - label: Mesh calibration (twist / grid)
         - label: First-layer check
         - label: PA / offset / skew calibration
-        - label: K1 Max extras (keep-out, wipe, True Zero touch, twist touch)
   - type: textarea
     id: results
     attributes:

@@ -998,7 +998,7 @@ def poly_eval(coef, order, x, y):
 def ref_height(xs, ys, matrix, ref, radius=60.0):
     """Mesh height at the zero reference from a smooth fit over the points
     within `radius` (quadratic, plane with few points), None if too few.
-    The mesh is pinned to this height (True Zero touches there): taken from
+    The mesh is pinned to this height (Z is homed or touched there): taken from
     the few nearest points, their texture noise would shift the whole mesh
     (~10-15 um between runs measured on 2026-10-29)."""
     pts = [(x, y, matrix[j][i]) for j, y in enumerate(ys)
@@ -3581,7 +3581,10 @@ class Lidar:
         if need_homed and "xyz" not in st["homed_axes"]:
             raise gcmd.error("LiDAR: home first (G28)")
         lo, hi = st["axis_minimum"], st["axis_maximum"]
+        # optional keep-out zones from a separate plugin (not part of
+        # FreeTheBeam since 0.5.0): any object with _blocked(a, b)
         ko = self.printer.lookup_object("keep_out", None)
+        ko_blocked = getattr(ko, "_blocked", None)
         xo, yo = (0.0, 0.0) if z is None else (self._xo(z), self._yo(z))
         nz = 0.0 if z is None else z
         for x0, y0, x1, y1 in segs:
@@ -3595,7 +3598,7 @@ class Lidar:
                             q[0] - p[0]) + abs(q[1] - p[1]) < 0.001 else
                             " (X%.1f Y%.1f with the skew correction)" % (
                                 q[0], q[1])))
-            if ko is not None and ko._blocked(a, b):
+            if ko_blocked is not None and ko_blocked(a, b):
                 raise gcmd.error(
                     "LiDAR: the nozzle would cross a keep-out zone (X%.1f"
                     " Y%.1f to X%.1f Y%.1f)" % (a[0], a[1], b[0], b[1]))
@@ -4896,8 +4899,8 @@ class Lidar:
             " (lidar_grid); LiDAR distance with the nozzle on the bed"
             " %.4fmm" % (dist,))
 
-    # also used by AXIS_TWIST_TOUCH_CALIBRATE (twist_touch.py), which measures
-    # the probe and the LiDAR against the same nozzle touches
+    # public: for other plugins that measure a probe and the LiDAR against the
+    # same nozzle touches
     def twist_reach(self, x, y, z=None):
         """Whether the laser can look at (x, y) from height z."""
         z = self.scan_z if z is None else z
