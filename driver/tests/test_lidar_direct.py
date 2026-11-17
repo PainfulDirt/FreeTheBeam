@@ -44,6 +44,15 @@ class DirectTests(unittest.TestCase):
         self.c = socket.socket(socket.AF_UNIX)
         self.c.connect(self.sock)
         self.c.settimeout(5)
+        # one round trip: serve() is idle in select() afterwards, so tests
+        # that use self.srv.dev directly never share the port with it
+        self.q(control='get_laser_gain')
+
+    def park_server(self):
+        """Tests that open a second Server on the same pty: the first one
+        must not re-init in its idle loop meanwhile."""
+        self.srv.next_init = float('inf')
+        self.srv.dev.close()
 
     def q(self, **msg):
         self.c.sendall(json.dumps(msg).encode() + b'\x03')
@@ -164,7 +173,7 @@ class DirectTests(unittest.TestCase):
         web.close()
         sock = self.sock + 'cam'
         srv = ld.Server(sock, self.srv.dev.port, camera_port=port)
-        self.srv.dev.close()
+        self.park_server()
         threading.Thread(target=srv.serve, daemon=True).start()
         for _ in range(50):
             if os.path.exists(sock):
@@ -280,10 +289,77 @@ class DirectTests(unittest.TestCase):
 
     def test_stream_mode_at_start(self):
         srv = ld.Server(self.sock + '2', self.srv.dev.port, stream_mode=1)
-        self.srv.dev.close()
+        self.park_server()
         self.assertTrue(srv.ensure_ready())
         self.assertEqual(self.fake.mode, 1)
         srv.dev.close()
+
+    def test_reinit_restores_client_settings(self):
+        self.q(control='set_laser_open'); self.q(control='open_flow')
+        self.q(control='set_point_cloud_level', level=1)
+        self.q(control='set_laser_exposure', exposure=4000)
+        self.q(control='set_laser_gain', gain=2000)
+        # module power-cycled: RAM settings lost
+        f = self.fake
+        f.authorized, f.stream, f.level, f.exp, f.gain = False, False, 0, 1000, 1000
+        r = self.q(control='get_point_cloud')['result']
+        self.assertEqual((r['code'], len(r['point_cloud'])), (0, 750))
+        self.assertEqual((f.exp, f.gain, f.laser, f.stream), (4000, 2000, 1, True))
+
+    def test_reinit_switches_fill_light_off(self):
+        self.srv.dev.set_fill_light(True)      # left on, e.g. by the camera
+        self.srv.led = True
+        self.srv.dev.close()                   # then the port was lost
+        self.srv.next_init = 0.0
+        self.assertEqual(self.q(control='get_laser_gain')['result']['code'], 0)
+        self.assertEqual(self.fake.led, 0)
+
+    def test_termios_error_is_not_fatal(self):
+        srv = ld.Server(self.sock + 'null', '/dev/null')   # tcgetattr: ENOTTY
+        self.assertFalse(srv.ensure_ready())
+        th = threading.Thread(target=srv.serve, daemon=True)
+        th.start()
+        time.sleep(0.5)
+        self.assertTrue(th.is_alive())
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(self.sock + 'null')
+        c.settimeout(5)
+        c.sendall(b'{"control": "get_laser_gain"}\x03')
+        self.assertEqual(json.loads(c.recv(4096)[:-1])['result']['code'], 101)
+
+    def test_prefetch_retries_after_lost_frame(self):
+        self.q(control='set_laser_open'); self.q(control='open_flow')
+        self.assertEqual(self.q(control='get_point_cloud', prefetch=1)['result']['code'], 0)
+        self.srv.next_init = 0.0               # (no init in the last 3 s)
+        self.fake.authorized = False           # frames stop coming
+        self.fake.stream = False
+        r = self.q(control='get_point_cloud', prefetch=1)['result']
+        self.assertEqual((r['code'], len(r['point_cloud'])), (0, 1500))
+
+    def test_idle_http_client_does_not_block(self):
+        web = socket.socket()
+        web.bind(('127.0.0.1', 0))
+        port = web.getsockname()[1]
+        web.close()
+        sock = self.sock + 'cam2'
+        srv = ld.Server(sock, self.srv.dev.port, camera_port=port)
+        self.park_server()
+        srv.camera_enabled = lambda: False
+        threading.Thread(target=srv.serve, daemon=True).start()
+        for _ in range(50):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        idle = socket.create_connection(('127.0.0.1', port))   # sends nothing
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(sock)
+        c.settimeout(5)
+        time.sleep(0.05)
+        t0 = time.monotonic()
+        c.sendall(b'{"control": "get_laser_gain"}\x03')
+        self.assertEqual(json.loads(c.recv(4096)[:-1])['result']['code'], 0)
+        self.assertLess(time.monotonic() - t0, 0.5)
+        idle.close()
 
     def test_camera_switch_from_moonraker(self):
         import http.server
@@ -301,14 +377,19 @@ class DirectTests(unittest.TestCase):
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         url = 'http://127.0.0.1:%d' % httpd.server_address[1]
         self.srv.set_moonraker(url, 'output_pin My_Cam')
+        self.assertIsNone(self.srv.camera_enabled())  # not read yet: off
+        self.srv.poll_switch()            # the camera thread, every 3 s
         self.assertTrue(self.srv.camera_enabled())
         self.assertEqual(queries, ['/printer/objects/query?output_pin%20My_Cam'])
         value[0] = 0
-        self.srv.cam_switch_time = -1e9           # past the 3 s cache
+        self.srv.poll_switch()
         self.assertFalse(self.srv.camera_enabled())
+        value[0] = 1
+        self.srv.poll_switch()
         self.srv.set_moonraker(url, 'output_pin Missing')
-        self.srv.cam_switch_time = -1e9
-        self.assertFalse(self.srv.camera_enabled())   # unreadable: off
+        self.srv.poll_switch()
+        # unreadable: the last known value stays (no flapping webcam)
+        self.assertTrue(self.srv.camera_enabled())
         httpd.shutdown()
         self.srv.set_moonraker(url, 'none')
         self.assertTrue(self.srv.camera_enabled())    # no switch: always on

@@ -50,8 +50,10 @@ import errno
 import json
 import os
 import select
+import signal
 import socket
 import sys
+import termios
 import threading
 import time
 import urllib.parse
@@ -64,6 +66,9 @@ import lidar_serial as ls  # noqa: E402
 ETX = b"\x03"
 LOG = "/tmp/lidar-direct.log"
 BAD_PARAM = 103
+# termios.error is not an OSError: EIO while the USB serial device
+# re-enumerates must not escape as an unexpected exception
+PORT_ERRORS = (OSError, termios.error)
 
 
 def log(msg):
@@ -125,7 +130,7 @@ class Stream:
             try:
                 data = dev.request(ls.GET_POINT_CLOUD, b"", 2.0)
                 t = clock()
-            except (OSError, ls.LidarError) as e:
+            except PORT_ERRORS + (ls.LidarError,) as e:
                 with self.cond:
                     self.error = e
                     self.cond.notify_all()
@@ -183,9 +188,16 @@ class Server:
         # fill light: on while somebody watches the camera (no flashing per
         # picture), off for every LiDAR request and after CAMERA_LIGHT_IDLE s
         self.led, self.cam_seen = False, 0.0
-        self.cam_switch, self.cam_switch_time = False, -1e9
+        # camera switch: None until Moonraker answered once; a failed query
+        # keeps the last known value (no flapping webcam entry)
+        self.cam_switch, self.cam_switch_time = None, -1e9
         # the webcam entry (--webcam) follows the switch (None: not synced yet)
-        self.cam_published = None
+        self.cam_published, self.cam_publish_retry = None, 0.0
+        # one thread at a time on the serial port: the serve loop (requests)
+        # and the camera thread (pictures, fill light) take this lock; the
+        # Stream thread only runs between start() and stop(), both called
+        # with the lock held, and nobody else talks to the module meanwhile
+        self.lock = threading.RLock()
         try:
             with open(os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                    "lidar-camera-off.jpg"), "rb") as f:
@@ -196,6 +208,9 @@ class Server:
         self.next_init = 0.0
         self.flow = False
         self.laser = False
+        # RAM-only module settings last set by a client (None: never set):
+        # restored after every re-init, e.g. after the module power-cycled
+        self.level = self.exposure = self.gain = None
         # module stream mode (lidar_serial.set_stream_mode); RAM only in the
         # module, so it's set again after every init
         self.stream_mode = stream_mode
@@ -209,11 +224,12 @@ class Server:
         if now < self.next_init:
             return False
         self.next_init = now + 3.0
+        flow, laser = self.flow, self.laser
         try:
             self.dev.close()
             self.dev.open()
             info = self.dev.init()
-            self.flow = self.laser = self.led = False
+            self.flow = self.laser = False
             self.apply_stream_mode()
             extra = ""
             try:
@@ -222,13 +238,49 @@ class Server:
                     self.dev.get_sensor_temp(), zlib.crc32(cal))
             except ls.LidarError as e:
                 extra = ", no temperature/calibration (%s)" % (e,)
-            log("module ready: %s, stream mode %d%s" % (
-                info, self.stream_mode, extra))
+            self.restore(flow, laser)
+            log("module ready: %s, stream mode %d%s%s" % (
+                info, self.stream_mode, extra, self.restored_text(flow, laser)))
             return True
-        except (OSError, ls.LidarError) as e:
+        except PORT_ERRORS + (ls.LidarError,) as e:
             log("init failed: %s" % (e,))
             self.dev.close()
+            # still what the clients want: the next init restores it
+            self.flow, self.laser = flow, laser
             return False
+
+    def restore(self, flow, laser):
+        """After an init the module may have restarted (RAM settings lost) or
+        kept the fill light on: put it into the state the clients set. The
+        stream is off here (apply_stream_mode). A status answer is logged;
+        a timeout fails the init."""
+        d = self.dev
+        steps = [("fill light off", d.set_fill_light, (False,))]
+        for name, v, fn in (("level", self.level, d.set_point_cloud_level),
+                            ("exposure", self.exposure, d.set_exposure),
+                            ("gain", self.gain, d.set_gain)):
+            if v is not None:
+                steps.append((name, fn, (v,)))
+        if laser:
+            steps.append(("laser", d.set_laser, (True,)))
+        if flow:
+            steps.append(("stream", d.open_flow, ()))
+        self.led = True       # unknown until switched off
+        for name, fn, args in steps:
+            try:
+                fn(*args)
+            except ls.LidarError as e:
+                if e.code == ls.FAILED:
+                    raise
+                log("restoring %s after init: %s" % (name, e))
+        self.led = False
+        self.flow, self.laser = flow, laser
+
+    def restored_text(self, flow, laser):
+        parts = ["%s %s" % (k, v) for k, v in (("level", self.level),
+                 ("exposure", self.exposure), ("gain", self.gain)) if v is not None]
+        parts += [k for k, v in (("laser", laser), ("stream", flow)) if v]
+        return ", restored " + " ".join(parts) if parts else ""
 
     def stream_off(self):
         """Stream off, also when it already is (the module answers that with
@@ -252,28 +304,27 @@ class Server:
             raise ls.LidarError("module not ready", ls.NOT_READY)
         try:
             return fn(*args)
-        except OSError as e:
+        except PORT_ERRORS as e:
             err = "port error: %s" % (e,)
         except ls.LidarError as e:
             if e.code != ls.FAILED:
                 raise           # the module answered with a status
             err = str(e)
         log("%s, re-initialising" % (err,))
-        self.dev.close()
-        self.next_init = 0.0
-        flow, laser = self.flow, self.laser
-        if not self.ensure_ready():
-            raise ls.LidarError("module not ready", ls.NOT_READY)
+        self.reinit()
         try:
-            if laser:
-                self.dev.set_laser(True)
-            if flow:
-                self.dev.open_flow()
-                self.flow = True
             return fn(*args)
-        except OSError as e:
+        except PORT_ERRORS as e:
             self.dev.close()
             raise ls.LidarError("port error: %s" % (e,))
+
+    def reinit(self):
+        """Close and initialise again now; restores laser, stream, level,
+        exposure and gain as the clients set them (restore())."""
+        self.dev.close()
+        self.next_init = 0.0
+        if not self.ensure_ready():
+            raise ls.LidarError("module not ready", ls.NOT_READY)
 
     # -- requests ----------------------------------------------------------
     def handle(self, req):
@@ -287,23 +338,30 @@ class Server:
             "set_fill_light_close": lambda: d.set_fill_light(False),
         }
         if c == "get_point_cloud" and req.get("prefetch"):
-            if not self.stream.running:
+            # like call(): after a timeout or port error re-initialise
+            # (restoring the stream) and try once more
+            for attempt in (0, 1):
+                if not self.stream.running:
+                    self.stream.stop()
+                    if attempt:
+                        self.reinit()
+                    elif not self.ensure_ready():
+                        raise ls.LidarError("module not ready", ls.NOT_READY)
+                    self.stream.start()
+                try:
+                    t, data = self.stream.take()
+                    return cloud_json(data, t)
+                except PORT_ERRORS as e:
+                    err = ls.LidarError("port error: %s" % (e,))
+                except ls.LidarError as e:
+                    if e.code != ls.FAILED:
+                        self.stream.stop()
+                        raise          # the module answered with a status
+                    err = e
                 self.stream.stop()
-                if not self.ensure_ready():
-                    raise ls.LidarError("module not ready", ls.NOT_READY)
-                self.stream.start()
-            try:
-                t, data = self.stream.take()
-            except OSError as e:
-                self.stream.stop()
-                self.dev.close()
-                raise ls.LidarError("port error: %s" % (e,))
-            except ls.LidarError as e:
-                self.stream.stop()
-                if e.code == ls.FAILED:
-                    self.dev.close()   # re-initialise on the next request
-                raise
-            return cloud_json(data, t)
+                self.dev.close()       # (re-initialised by the next attempt/request)
+                log("prefetch: %s%s" % (err, "" if attempt else ", re-initialising"))
+            raise err
         self.stream.stop()   # everything else talks to the module itself
         if c == "get_point_cloud":
             data = self.call(d.request, ls.GET_POINT_CLOUD, b"", 2.0)
@@ -320,6 +378,7 @@ class Server:
             if lv not in (0, 1, 2):
                 return BAD_PARAM
             self.call(d.set_point_cloud_level, lv)
+            self.level = lv
             return {}
         if c == "get_point_cloud_level":
             return {"level": self.call(d.get_point_cloud_level)}
@@ -354,6 +413,7 @@ class Server:
             self.call(self.stream_off)
             self.laser = False
             code = self.call(d.self_test)
+            self.led = False
             return {"self_test": code, "laser_ok": not code & 1,
                     "light_ok": not code & 2}
         if c == "ambient_points":
@@ -381,6 +441,7 @@ class Server:
             if not isinstance(v, int) or not 0 < v < 1 << 24:
                 return BAD_PARAM
             self.call(d.set_exposure if k == "exposure" else d.set_gain, v)
+            setattr(self, k, v)        # self.exposure / self.gain
             return {}
         if c == "ir_photo":
             return self.ir_photo(req)
@@ -414,23 +475,28 @@ class Server:
         self.WEBCAM_NAME = webcam or None
 
     def camera_enabled(self):
-        """The camera switch (a Klipper object with a "value", e.g. an
-        output_pin), read from Moonraker at most every 3 s; off when it
-        can't be read."""
+        """The camera switch as last read by poll_switch() (never blocks);
+        None (= off) until Moonraker answered once; always on without a
+        switch (--camera-switch none)."""
         if self.CAMERA_SWITCH is None:
             return True
-        now = time.monotonic()
-        if now - self.cam_switch_time > 3.0:
-            self.cam_switch_time = now
-            url = "%s/printer/objects/query?%s" % (
-                self.MOONRAKER, urllib.parse.quote(self.CAMERA_SWITCH))
-            try:
-                with urllib.request.urlopen(url, timeout=1.0) as r:
-                    st = json.loads(r.read().decode())["result"]["status"]
-                self.cam_switch = st[self.CAMERA_SWITCH]["value"] > 0
-            except Exception:
-                self.cam_switch = False
         return self.cam_switch
+
+    def poll_switch(self):
+        """Read the camera switch (a Klipper object with a "value", e.g. an
+        output_pin) from Moonraker; called by the camera thread every 3 s.
+        A failed query keeps the last known value."""
+        self.cam_switch_time = time.monotonic()
+        if self.CAMERA_SWITCH is None:
+            return
+        url = "%s/printer/objects/query?%s" % (
+            self.MOONRAKER, urllib.parse.quote(self.CAMERA_SWITCH))
+        try:
+            with urllib.request.urlopen(url, timeout=2.0) as r:
+                st = json.loads(r.read().decode())["result"]["status"]
+            self.cam_switch = st[self.CAMERA_SWITCH]["value"] > 0
+        except Exception:
+            pass
 
     def ir_photo(self, req):
         """One JPEG (res 3 = 1600x1200) for the calibrations (helper service): fill light
@@ -449,10 +515,15 @@ class Server:
         flow, laser = self.flow, self.laser
         prev = self.call(d.get_exposure)
         t0 = time.monotonic()
-        try:
-            self.call(d.set_exposure, exp)
+
+        def capture():
+            # one unit for call(): a re-init in between restores the
+            # client's exposure, so the retry sets this picture's again
+            d.set_exposure(exp)
             self.light(bool(req.get("light", 1)))
-            jpg = self.call(d.capture_jpeg, res, bool(req.get("laser", 0)))
+            return d.capture_jpeg(res, bool(req.get("laser", 0)))
+        try:
+            jpg = self.call(capture)
         finally:
             # the capture switched the stream (and the laser) off
             self.flow = self.laser = False
@@ -483,41 +554,79 @@ class Server:
         try:
             self.dev.set_fill_light(on)
             self.led = on
-        except (ls.LidarError, OSError) as e:
+        except PORT_ERRORS + (ls.LidarError,) as e:
             log("fill light %s: %s" % ("on" if on else "off", e))
+
+    def light_off_if_free(self):
+        """Fill light off from the camera thread, unless a LiDAR request
+        holds the port (reply() switches it off itself). With the port
+        closed the next init switches it off (restore())."""
+        if self.led and self.dev.ready and self.lock.acquire(blocking=False):
+            try:
+                if self.led and self.dev.ready and not self.stream.running:
+                    self.light(False)
+            finally:
+                self.lock.release()
 
     def camera_tick(self):
         """Fill light off once nobody watches or the switch went off; the
         Moonraker webcam entry (--webcam) is enabled/disabled with the
-        switch."""
+        switch (not before the switch was read once; a failed update is
+        retried after 30 s)."""
         enabled = self.camera_enabled()
-        if self.led and (time.monotonic() - self.cam_seen > self.CAMERA_LIGHT_IDLE
-                         or not enabled):
-            self.light(False)
-        if self.WEBCAM_NAME and enabled != self.cam_published:
-            self.cam_published = enabled
-            body = json.dumps({"name": self.WEBCAM_NAME, "enabled": enabled}).encode()
-            try:
-                req = urllib.request.Request(
-                    self.MOONRAKER + "/server/webcams/item", data=body, headers={
+        now = time.monotonic()
+        if self.led and (now - self.cam_seen > self.CAMERA_LIGHT_IDLE or not enabled):
+            self.light_off_if_free()
+        if not self.WEBCAM_NAME or enabled is None \
+                or enabled == self.cam_published \
+                or now < self.cam_publish_retry:
+            return
+        body = json.dumps({"name": self.WEBCAM_NAME, "enabled": enabled}).encode()
+        try:
+            req = urllib.request.Request(
+                self.MOONRAKER + "/server/webcams/item", data=body, headers={
                     "Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=2.0).read()
-                log("camera %s (webcam %s)" % (
-                    "on" if enabled else "off", self.WEBCAM_NAME))
-            except Exception as e:
-                log("camera: updating the webcam failed: %s" % (e,))
+            urllib.request.urlopen(req, timeout=2.0).read()
+            self.cam_published = enabled
+            log("camera %s (webcam %s)" % (
+                "on" if enabled else "off", self.WEBCAM_NAME))
+        except Exception as e:
+            self.cam_publish_retry = now + 30.0
+            log("camera: updating the webcam failed: %s" % (e,))
+
+    def camera_monitor(self):
+        """Camera thread: switch every 3 s, fill light, webcam entry. Moonraker
+        queries never run in the serve loop."""
+        while True:
+            try:
+                if time.monotonic() - self.cam_switch_time > 3.0:
+                    self.poll_switch()
+                self.camera_tick()
+            except Exception as e:   # never let it die
+                log("camera monitor: unexpected %r" % (e,))
+            time.sleep(1.0)
 
     def camera_jpeg(self, res, light):
-        """(jpeg or None, 'live' / 'cached' / reason)."""
+        """(jpeg or None, 'live' / 'cached' / reason). Runs in an HTTP thread:
+        never waits for the port; a LiDAR request in progress = cached."""
         now = time.monotonic()
         if not self.camera_enabled():
-            self.light(False)
+            self.light_off_if_free()
             return self.off_jpeg, "off (camera switch %s)" % (self.CAMERA_SWITCH,)
         self.cam_seen = now
         if self.cam_jpeg and now - self.cam_time < self.CAMERA_MIN_AGE:
             return self.cam_jpeg, "cached"
-        if now - self.last_use < self.CAMERA_IDLE or self.stream.running:
+        if not self.lock.acquire(blocking=False):
             return self.cam_jpeg, "cached (LiDAR busy)"
+        try:
+            if time.monotonic() - self.last_use < self.CAMERA_IDLE or self.stream.running:
+                return self.cam_jpeg, "cached (LiDAR busy)"
+            return self.camera_capture(res, light)
+        finally:
+            self.lock.release()
+
+    def camera_capture(self, res, light):
+        """camera_jpeg with the port lock held."""
         if not self.ensure_ready():
             return self.cam_jpeg, "cached (module not ready)"
         d = self.dev
@@ -529,7 +638,7 @@ class Server:
         except ls.LidarError as e:
             state = "cached (%s)" % (e,)
             log("camera: %s" % (e,))
-        except OSError as e:
+        except PORT_ERRORS as e:
             log("camera: port error %s" % (e,))
             self.dev.close()
             return self.cam_jpeg, "cached (port error)"
@@ -542,9 +651,11 @@ class Server:
             if flow:
                 d.open_flow()
                 self.flow = True
-        except (ls.LidarError, OSError) as e:
+        except PORT_ERRORS + (ls.LidarError,) as e:
             log("camera: restoring the stream failed: %s" % (e,))
             self.dev.close()
+            # the next init restores them (and switches the fill light off)
+            self.flow, self.laser = flow, laser
         return self.cam_jpeg, state
 
     PAGE = (b"<!doctype html><title>LiDAR camera</title><body style='margin:0;"
@@ -587,11 +698,46 @@ class Server:
                           "%s\r\n" % (status, ctype, len(body), extra)).encode() + body)
         except OSError:
             pass
+        except Exception as e:      # one connection must not take the thread
+            log("camera http: unexpected %r" % (e,))
         finally:
             conn.close()
 
+    CAMERA_CONNS = 4         # HTTP connections served at once (more: closed)
+
+    def camera_server(self, web):
+        """Camera HTTP in its own threads, one per connection: an idle or
+        slow client never blocks the LiDAR socket."""
+        slots = threading.BoundedSemaphore(self.CAMERA_CONNS)
+
+        def run(conn):
+            try:
+                self.camera_http(conn)
+            finally:
+                slots.release()
+        while True:
+            try:
+                conn, _ = web.accept()
+            except OSError as e:
+                log("camera accept: %s" % (e,))
+                time.sleep(1.0)
+                continue
+            if not slots.acquire(blocking=False):
+                conn.close()
+                continue
+            try:
+                threading.Thread(target=run, args=(conn,), daemon=True).start()
+            except RuntimeError as e:   # can't start a thread (memory)
+                slots.release()
+                conn.close()
+                log("camera: %s" % (e,))
+
     def reply(self, req):
         self.last_use = time.monotonic()
+        with self.lock:
+            return self.reply_locked(req)
+
+    def reply_locked(self, req):
         if self.led and self.dev.ready:
             self.light(False)          # never measure with the fill light on
         c = req.get("control") if isinstance(req, dict) else None
@@ -609,9 +755,30 @@ class Server:
         return json.dumps({"control": c, "result": res})
 
     # -- socket ------------------------------------------------------------
+    def drop_stale_socket(self):
+        """A driver that died leaves its socket behind (clients then get
+        'connection refused'): remove it, unless a driver still answers."""
+        if not os.path.exists(self.sock_path):
+            return
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(1.0)
+            probe.connect(self.sock_path)
+            log("%s: another driver answers there (replaced)" % (self.sock_path,))
+        except OSError:
+            try:
+                os.unlink(self.sock_path)
+                log("removed stale %s" % (self.sock_path,))
+            except OSError:
+                pass
+        finally:
+            probe.close()
+
     def serve(self):
         # bind under a temporary name and rename: the path only appears
-        # once the socket accepts connections
+        # once the socket accepts connections and the startup init is done
+        # (no client request runs during it)
+        self.drop_stale_socket()
         tmp = self.sock_path + ".new"
         try:
             os.unlink(tmp)
@@ -621,57 +788,70 @@ class Server:
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(tmp)
         srv.listen(8)
-        os.rename(tmp, self.sock_path)
-        clients = {}   # socket -> receive buffer
-        log("listening on %s" % (self.sock_path,))
-        cam = []
+        web = None
         if self.camera_port:
             web = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             web.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             web.bind(("", self.camera_port))
             web.listen(4)
-            cam = [web]
+        with self.lock:
+            self.ensure_ready()
+        os.rename(tmp, self.sock_path)
+        log("listening on %s" % (self.sock_path,))
+        if web is not None:
+            for fn, args in ((self.camera_server, (web,)), (self.camera_monitor, ())):
+                threading.Thread(target=fn, args=args, daemon=True).start()
             log("IR camera on http port %d" % (self.camera_port,))
-        self.ensure_ready()
-        while True:
-            r, _, _ = select.select([srv] + cam + list(clients), [], [], 5.0)
-            if not r and not self.dev.ready:
-                self.ensure_ready()   # keep retrying while idle
-            if cam:
-                self.camera_tick()
-            for s in r:
-                if s is srv:
-                    c, _ = srv.accept()
-                    clients[c] = b""
-                    continue
-                if cam and s is cam[0]:
-                    c, _ = s.accept()
-                    self.camera_http(c)
-                    continue
+        clients = {}   # socket -> receive buffer
+        try:
+            while True:
                 try:
-                    data = s.recv(65536)
+                    self.serve_once(srv, clients)
+                except Exception as e:   # the daemon must keep running
+                    log("serve loop: unexpected %r" % (e,))
+                    time.sleep(1.0)
+        finally:
+            try:
+                os.unlink(self.sock_path)
+            except OSError:
+                pass
+
+    def serve_once(self, srv, clients):
+        r, _, _ = select.select([srv] + list(clients), [], [], 5.0)
+        if not self.dev.ready:
+            with self.lock:
+                self.ensure_ready()   # keep retrying (at most every 3 s)
+        for s in r:
+            if s is srv:
+                c, _ = srv.accept()
+                clients[c] = b""
+                continue
+            try:
+                data = s.recv(65536)
+            except OSError:
+                data = b""
+            if not data:
+                clients.pop(s, None)
+                s.close()
+                continue
+            buf = clients[s] + data
+            while ETX in buf:
+                msg, buf = buf.split(ETX, 1)
+                try:
+                    req = json.loads(msg.decode(errors="replace"))
+                except ValueError:
+                    req = None
+                out = self.reply(req).encode() + ETX
+                try:
+                    s.settimeout(10.0)   # a client that stops reading is dropped
+                    s.sendall(out)
                 except OSError:
-                    data = b""
-                if not data:
+                    buf = b""
                     clients.pop(s, None)
                     s.close()
-                    continue
-                buf = clients[s] + data
-                while ETX in buf:
-                    msg, buf = buf.split(ETX, 1)
-                    try:
-                        req = json.loads(msg.decode(errors="replace"))
-                    except ValueError:
-                        req = None
-                    out = self.reply(req).encode() + ETX
-                    try:
-                        s.setblocking(True)
-                        s.sendall(out)
-                    except OSError:
-                        buf = b""
-                        break
-                if s in clients:
-                    clients[s] = buf[-65536:]
+                    break
+            if s in clients:
+                clients[s] = buf[-65536:]
 
 
 def parse_args(argv):
@@ -709,9 +889,20 @@ def main():
         # the module may enumerate after we start (boot order): keep retrying
         print("lidar-direct: %s not found, waiting for the LiDAR to show up"
               % args.port, file=sys.stderr, flush=True)
-    srv = Server(args.socket, args.port, args.stream_mode, args.camera_port)
-    srv.set_moonraker(args.moonraker, args.camera_switch, args.webcam)
-    srv.serve()
+
+    def stop(signum, frame):
+        raise SystemExit(0)    # serve() removes its socket on the way out
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        srv = Server(args.socket, args.port, args.stream_mode,
+                     args.camera_port)
+        srv.set_moonraker(args.moonraker, args.camera_switch, args.webcam)
+        srv.serve()
+    except SystemExit:
+        log("stopped")
+    except Exception as e:
+        log("fatal: %r" % (e,))
+        raise
 
 
 if __name__ == "__main__":

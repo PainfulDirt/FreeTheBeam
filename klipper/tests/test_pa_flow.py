@@ -1,6 +1,7 @@
-"""klipper/lidar.py: LIDAR_PA_FLOW_CALIBRATE, LIDAR_PA_FLOW_STEP and the
-camera LIDAR_OFFSET_CALIBRATE with stand-in Klipper objects and a stub
-helper service (planning by the real helper/lidar_pa_flow.py)."""
+"""klipper/lidar.py: LIDAR_PA_FLOW_CALIBRATE, LIDAR_PA_FLOW_STEP, the
+benchmark saves (LIDAR_PA_SAVE / LIDAR_FLOW_SAVE) and the camera
+LIDAR_OFFSET_CALIBRATE with stand-in Klipper objects and a stub helper
+service (planning by the real helper/lidar_pa_flow.py)."""
 import json
 import math
 import os
@@ -69,12 +70,27 @@ def make(service="HELPER_IP:7131", state="standby", filename="",
                     "median": getattr(L, "photo_median", 3.0)}
         if c == "pf_analyze":
             L.analyze_req = req
-            return dict(analyze or {
-                "pa": {"ok": True, "pa": 0.042, "report": ["  pa line"]},
-                "pa_method": "camera",
-                "flow": {"ok": True, "f": 0.946, "dfdh": 4.26, "sd": 0.019,
-                         "report": ["  flow line"]},
-                "contrast": 50.0}, ok=True, html="/var/lib/lidar-helper/pf.html")
+            if analyze is not None:
+                return dict(analyze, ok=True, html="/var/lib/lidar-helper/pf.html")
+            t = req["test"]
+            m = t.get("flow", {}).get("method")
+            fl = {"ok": True, "flow": 1.04, "f": 0.9615,
+                  "report": ["  flow line"]}
+            flows = dict((k, dict(fl, flow=1.04 if k == "ir" else 1.0,
+                                  f=0.9615 if k == "ir" else 1.0))
+                         for k in (("ir", "lidar") if m == "both" else (m,))
+                         if k)
+            pm = t.get("pa", {}).get("method")
+            pas = dict((k, {"ok": True, "pa": 0.042 if k == "ir" else 0.038,
+                            "report": ["  pa line"]})
+                       for k in (("ir", "lidar") if pm == "both" else (pm,))
+                       if k)
+            return {"pa": pas.get(pm) if pm != "both" else None, "pas": pas,
+                    "pa_mode": pm,
+                    "pa_method": {"ir": "camera", "lidar": "lidar"}.get(pm, "none"),
+                    "flow": flows.get(m) if m != "both" else None,
+                    "flows": flows, "flow_method": m, "contrast": 50.0,
+                    "ok": True, "html": "/var/lib/lidar-helper/pf.html"}
         return {"ok": True}
     L._svc = svc
     return L
@@ -109,6 +125,23 @@ class CalibrateTests(unittest.TestCase):
             calibrate(L)
         self.assertEqual(L.ev, [])
 
+    def test_calibrate_bad_params(self):
+        for kw in ({"TESTS": "FOO"}, {"FLOW_METHOD": "X"}, {"PA_METHOD": "X"},
+                   {"FLOWS": "92,96,100"}, {"TESTS": ""}):
+            L = make()
+            with self.assertRaises(Err):
+                calibrate(L, **kw)
+            self.assertFalse(os.path.exists(os.path.join(
+                L.gcode_dir, "lidar_pa_flow_test.gcode")))
+
+    def test_calibrate_tells_area(self):
+        L = make()
+        calibrate(L, TESTS="FLOW")
+        msg = [e[1] for e in L.ev if e[0] == "info"][0]
+        self.assertIn("X86-206 Y33-87", msg)
+        self.assertIn("flow", msg)
+        self.assertEqual(L.pf["tests"], ["flow"])
+
     def test_calibrate_reach_refused(self):
         L = make()
 
@@ -122,12 +155,18 @@ class CalibrateTests(unittest.TestCase):
 
 
 class StepTests(unittest.TestCase):
-    def started(self, flow_save=0, **kw):
+    def started(self, cal=None, **kw):
+        # FreeTheBeam's FLOW_METHOD default is BOTH (experimental flow):
+        # these tests start from the camera like the K1 Max buttons
         L = make(**kw)
-        calibrate(L, FLOW_SAVE=flow_save)
+        calibrate(L, **dict({"FLOW_METHOD": "IR"}, **(cal or {})))
         L.stats.update(state="printing", filename="lidar_pa_flow_test.gcode")
         del L.ev[:]
         return L
+
+    def run_all(self, L):
+        for st in ("BARE", "PHOTOS", "ANALYZE"):
+            L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP=st))
 
     def test_step_without_job_errors(self):
         L = self.started()
@@ -146,14 +185,20 @@ class StepTests(unittest.TestCase):
         order = [e[1] if e[0] in ("svc", "scan") else e[1].split("\n")[0]
                  for e in L.ev if e[0] in ("svc", "scan", "gcode")]
         self.assertEqual(order[0], "M104 S150")
-        i_ae = order.index("auto_exposure")
-        i_ph = order.index("photo")
-        scans = [e[1] for e in L.ev if e[0] == "scan"]
-        self.assertEqual(scans, ["pf_g0", "pf_g1", "pf_g2", "pf_g3"])
-        self.assertTrue(i_ae < i_ph < order.index("pf_g0"))
+        self.assertTrue(order.index("auto_exposure") < order.index("photo"))
+        self.assertEqual([e[1] for e in L.ev if e[0] == "scan"], [])   # camera only
         self.assertEqual(L.pf["exposure"], 4000)
-        self.assertEqual(sorted(L.pf["mesh"]), ["pf_g0", "pf_g1", "pf_g2", "pf_g3"])
-        self.assertEqual(L.pf["mesh"]["pf_g0"][0], [33.0, 0.01])
+
+    def test_bare_step_lidar_strips(self):
+        L = self.started(cal={"TESTS": "FLOW", "FLOW_METHOD": "LIDAR"})
+        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="BARE"))
+        self.assertEqual([e[1] for e in L.ev if e[0] == "scan"],
+                         ["pf_b%d" % i for i in range(1, 7)])
+        del L.ev[:]
+        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="PHOTOS"))
+        self.assertEqual([e[1] for e in L.ev if e[0] == "scan"],
+                         ["pf_b%d_after" % i for i in range(1, 7)])
+        self.assertFalse([e for e in L.ev if e == ("svc", "photo")])
 
     def test_bare_step_unreadable_photo(self):
         L = self.started()
@@ -166,36 +211,132 @@ class StepTests(unittest.TestCase):
         L = self.started()
         L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="BARE"))
         del L.ev[:]
+        exp = []
+        svc = L._svc
+        L._svc = lambda req, timeout=30.0: (exp.append(
+            (req["name"], req["exposure"])) if req["cmd"] == "photo" else None) \
+            or svc(req, timeout)
         L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="PHOTOS"))
-        self.assertEqual(len([e for e in L.ev if e == ("svc", "photo")]), 9)
-
-    def test_analyze_default_saves_pa_not_flow(self):
-        # flow is experimental: measured and reported, saved only on request
-        L = self.started(variables={"fl_zoffset": {"PLA_Matte": 0.005}})
-        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="BARE"))
-        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="ANALYZE"))
-        s = saves(L)
-        self.assertEqual(s, ["SET_PRESSURE_ADVANCE ADVANCE=0.0420\n"
-                             "SAVE_VARIABLE VARIABLE=lidar_pa VALUE=0.0420"])
-        info = [e[1] for e in L.ev if e[0] == "info"]
-        self.assertTrue(any("NOT saved" in m and "FLOW_SAVE=1" in m
-                            for m in info), info)
+        self.assertEqual(len(exp), 12)               # 6 PA + 6 bands
+        self.assertEqual(dict(exp)["B1"], 1000)      # bands: the rule's exposure
+        self.assertEqual(dict(exp)["T1"], 2000)      # dark plate
 
     def test_analyze_saves(self):
-        L = self.started(flow_save=1,
-                         variables={"fl_zoffset": {"PLA_Matte": 0.005}})
-        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="BARE"))
-        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="ANALYZE"))
+        L = self.started(variables={"fl_zoffset": {"PLA_Matte": 0.005}})
+        self.run_all(L)
         s = saves(L)
         self.assertIn("SAVE_VARIABLE VARIABLE=lidar_pa VALUE=0.0420", "\n".join(s))
         flow = [x for x in s if "lidar_flow" in x][0]
         val = eval(flow.split("VALUE=", 1)[1].strip('"'))
-        self.assertEqual(val["PLA_Matte"]["f"], 0.946)
-        self.assertEqual(val["PLA_Matte"]["dfdh"], 4.26)
+        self.assertEqual(val["PLA_Matte"]["f"], 0.9615)
+        self.assertEqual(val["PLA_Matte"]["dfdh"], 0.0)
         self.assertEqual(val["PLA_Matte"]["z"], 0.005)
+        self.assertEqual(val["PLA_Matte"]["src"], "ir")
         self.assertIn("t", val["PLA_Matte"])
         self.assertIsNone(L.pf)
-        self.assertIn("tables", L.analyze_req)
+
+    def test_pa_only_saves_only_pa(self):
+        L = self.started(cal={"TESTS": "PA"})
+        self.assertNotIn("flow", L.pf)
+        self.run_all(L)
+        s = saves(L)
+        self.assertEqual(len(s), 1)
+        self.assertIn("lidar_pa", s[0])
+
+    def test_flow_only_saves_only_flow(self):
+        L = self.started(cal={"TESTS": "FLOW", "FLOW_METHOD": "LIDAR"})
+        self.assertNotIn("pa", L.pf)
+        self.run_all(L)
+        s = saves(L)
+        self.assertEqual(len(s), 1)
+        val = eval(s[0].split("VALUE=", 1)[1].strip('"'))
+        self.assertEqual(val["PLA_Matte"]["src"], "lidar")
+        self.assertFalse([e for e in L.ev if e[0] == "gcode"
+                          and "SET_PRESSURE_ADVANCE" in e[1]])
+
+    def test_benchmark_saves_nothing_and_asks(self):
+        L = self.started(cal={"TESTS": "FLOW", "FLOW_METHOD": "BOTH"})
+        self.run_all(L)
+        self.assertEqual(saves(L), [])
+        g = "\n".join(e[1] for e in L.ev if e[0] == "gcode")
+        self.assertIn("action:prompt_begin", g)
+        self.assertIn("LIDAR_FLOW_SAVE METHOD=IR", g)
+        self.assertIn("LIDAR_FLOW_SAVE METHOD=LIDAR", g)
+        self.assertIn("action:prompt_show", g)
+        # the user picks the LiDAR's band
+        del L.ev[:]
+        L.cmd_LIDAR_FLOW_SAVE(Gcmd(METHOD="LIDAR"))
+        val = eval(saves(L)[0].split("VALUE=", 1)[1].strip('"'))
+        self.assertEqual(val["PLA_Matte"]["f"], 1.0)
+        self.assertEqual(val["PLA_Matte"]["src"], "lidar")
+        self.assertIn("action:prompt_end", "\n".join(
+            e[1] for e in L.ev if e[0] == "gcode"))
+
+    def test_pa_lidar_scans_on_dark_plate(self):
+        L = self.started(cal={"TESTS": "PA", "PA_METHOD": "LIDAR"})
+        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="BARE"))      # photo median 3: dark
+        self.assertEqual([e[1] for e in L.ev if e[0] == "scan"], ["pf_pa_base"])
+        del L.ev[:]
+        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="PHOTOS"))
+        self.assertEqual([e[1] for e in L.ev if e[0] == "scan"], ["pf_pa_scan"])
+        self.assertFalse([e for e in L.ev if e == ("svc", "photo")])
+        L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="ANALYZE"))
+        self.assertIn("SAVE_VARIABLE VARIABLE=lidar_pa VALUE=0.0380",
+                      "\n".join(saves(L)))
+
+    def test_pa_flow_benchmark_asks_for_both(self):
+        L = self.started(cal={"TESTS": "PA,FLOW", "PA_METHOD": "BOTH",
+                              "FLOW_METHOD": "BOTH"})
+        self.run_all(L)
+        self.assertEqual(saves(L), [])
+        g = "\n".join(e[1] for e in L.ev if e[0] == "gcode")
+        for c in ("LIDAR_PA_SAVE METHOD=IR", "LIDAR_PA_SAVE METHOD=LIDAR",
+                  "LIDAR_FLOW_SAVE METHOD=IR", "LIDAR_FLOW_SAVE METHOD=LIDAR"):
+            self.assertIn(c, g)
+        self.assertEqual(len([e for e in L.ev if e[0] == "scan"]), 14)
+        # PA first: the prompt comes back with only the flow buttons
+        del L.ev[:]
+        L.cmd_LIDAR_PA_SAVE(Gcmd(METHOD="LIDAR"))
+        g = "\n".join(e[1] for e in L.ev if e[0] == "gcode")
+        self.assertIn("SAVE_VARIABLE VARIABLE=lidar_pa VALUE=0.0380", g)
+        self.assertIn("SET_PRESSURE_ADVANCE ADVANCE=0.0380", g)
+        self.assertNotIn("LIDAR_PA_SAVE", g)
+        self.assertIn("LIDAR_FLOW_SAVE METHOD=IR", g)
+        self.assertIn("action:prompt_show", g)
+        # then the flow: nothing left, the prompt closes
+        del L.ev[:]
+        L.cmd_LIDAR_FLOW_SAVE(Gcmd(METHOD="IR"))
+        g = "\n".join(e[1] for e in L.ev if e[0] == "gcode")
+        self.assertIn("lidar_flow", g)
+        self.assertIn("action:prompt_end", g)
+        self.assertNotIn("action:prompt_show", g)
+        with self.assertRaises(Err):
+            L.cmd_LIDAR_PA_SAVE(Gcmd(METHOD="FOO"))
+
+    def test_flow_benchmark_has_no_pa_to_save(self):
+        L = self.started(cal={"TESTS": "FLOW", "FLOW_METHOD": "BOTH"})
+        self.run_all(L)
+        with self.assertRaises(Err):
+            L.cmd_LIDAR_PA_SAVE(Gcmd(METHOD="IR"))
+
+    def test_flow_save_refuses(self):
+        L = make()
+        with self.assertRaises(Err):                # no benchmark yet
+            L.cmd_LIDAR_FLOW_SAVE(Gcmd(METHOD="IR"))
+        L = self.started(cal={"TESTS": "FLOW", "FLOW_METHOD": "BOTH"},
+                         analyze={"pa": None, "pa_method": "none", "flow": None,
+                                  "flow_method": "both", "contrast": None,
+                                  "flows": {"ir": {"ok": True, "flow": 1.04,
+                                                   "f": 0.9615, "report": []},
+                                            "lidar": {"ok": False, "reason": "flat",
+                                                      "report": []}}})
+        self.run_all(L)
+        with self.assertRaises(Err):                # LiDAR picked nothing
+            L.cmd_LIDAR_FLOW_SAVE(Gcmd(METHOD="LIDAR"))
+        with self.assertRaises(Err):
+            L.cmd_LIDAR_FLOW_SAVE(Gcmd(METHOD="FOO"))
+        L.cmd_LIDAR_FLOW_SAVE(Gcmd(METHOD="IR"))
+        self.assertEqual(len(saves(L)), 1)
 
     def test_analyze_failure_saves_nothing(self):
         L = self.started(svc_fail="pf_analyze")
@@ -204,16 +345,16 @@ class StepTests(unittest.TestCase):
         self.assertTrue(any("analysis" in e[1] for e in L.ev if e[0] == "info"))
         self.assertIsNone(L.pf)
         L = self.started(analyze={"pa": {"ok": False, "reason": "noisy", "report": []},
-                                  "pa_method": "none",
+                                  "pa_method": "none", "flow_method": "ir",
                                   "flow": {"ok": False, "reason": "contrast", "report": []},
-                                  "contrast": 4.0})
+                                  "flows": {}, "contrast": 4.0})
         L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="ANALYZE"))
         self.assertEqual(saves(L), [])
 
     @unittest.skipIf(test_flow_apply.jinja2 is None, "jinja2 not installed")
     def test_flow_key_roundtrip(self):
         name = 'PLA "Matte" @K1 Max'
-        L = self.started(flow_save=1)
+        L = self.started()
         L.pf["filament_name"] = name
         L.cmd_LIDAR_PA_FLOW_STEP(Gcmd(STEP="ANALYZE"))
         flow = [x for x in saves(L) if "lidar_flow" in x][0]
@@ -231,20 +372,47 @@ class GenericTests(unittest.TestCase):
         L.cmd_LIDAR_PA_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
         self.assertTrue(os.path.exists(os.path.join(
             L.gcode_dir, "lidar_pa_flow_test.gcode")))
+        self.assertEqual(L.pf["tests"], ["pa"])
+        self.assertEqual(L.pf["pa"]["method"], "ir")
 
-    def test_pa_calibrate_lidar_print_without_camera(self):
-        for kw in ({"service": None}, {"camera": False}, {"x_dir": 1.0}):
-            L = make(service=kw.get("service", "HELPER_IP:7131"))
-            for k in ("camera", "x_dir"):
-                if k in kw:
-                    setattr(L, k, kw[k])
+    def test_pa_calibrate_method(self):
+        L = make()
+        L.cmd_LIDAR_PA_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60,
+                                      METHOD="BOTH"))
+        self.assertEqual(L.pf["pa"]["method"], "both")
+
+    def test_pa_calibrate_lidar_print_without_helper(self):
+        # no helper, or the service on the printer itself (no numpy)
+        for service in (None, "127.0.0.1:7131", "localhost:7131"):
+            L = make(service=service)
             called = []
             L._pa_lidar_print = lambda gcmd: called.append(gcmd)
             L.cmd_LIDAR_PA_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
-            self.assertEqual(len(called), 1, kw)
-            if "service" not in kw:
-                with self.assertRaises(Err):
+            self.assertEqual(len(called), 1, service)
+            if service:
+                with self.assertRaises(Err):     # local mode: no camera work
                     calibrate(L)
+
+    def test_pa_calibrate_lidar_strips_without_camera(self):
+        for kw in ({"camera": False}, {"x_dir": 1.0}):
+            L = make()
+            for k, v in kw.items():
+                setattr(L, k, v)
+            L._pa_lidar_print = lambda gcmd: self.fail("LiDAR-only print")
+            L.cmd_LIDAR_PA_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
+            self.assertEqual(L.pf["pa"]["method"], "lidar", kw)
+            # the camera's methods are refused
+            with self.assertRaises(Err):
+                calibrate(L)
+            with self.assertRaises(Err):
+                calibrate(L, TESTS="FLOW", FLOW_METHOD="BOTH")
+            calibrate(L, TESTS="FLOW", FLOW_METHOD="LIDAR")
+
+    def test_flow_defaults_to_benchmark(self):
+        # experimental: without FLOW_METHOD nothing is saved, the user picks
+        L = make()
+        calibrate(L)
+        self.assertEqual(L.pf["flow"]["method"], "both")
 
     def test_offset_lidar_only_without_camera(self):
         L = make(service=None)
@@ -252,14 +420,16 @@ class GenericTests(unittest.TestCase):
         L._offset_lidar = lambda gcmd: called.append("lidar")
         L._offset_camera = lambda gcmd: called.append("camera")
         L.cmd_LIDAR_OFFSET_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
+        L.service = "127.0.0.1:7131"           # local mode: no numpy
+        L.cmd_LIDAR_OFFSET_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
         L.service = "HELPER_IP:7131"
         L.cmd_LIDAR_OFFSET_CALIBRATE(Gcmd(EXTRUDER_TEMP=210, BED_TEMP=60))
-        self.assertEqual(called, ["lidar", "camera"])
+        self.assertEqual(called, ["lidar", "lidar", "camera"])
 
     def test_placement_centred_when_the_k1_spot_does_not_fit(self):
         L = make()
         st = {"homed_axes": "", "axis_minimum": [0.0, 0.0, 0.0],
-              "axis_maximum": [235.0, 235.0, 250.0]}
+              "axis_maximum": [235.0, 200.0, 250.0]}
         th = L.printer.lookup_object("toolhead")
         th.get_status = lambda t: st
         look = L.printer.lookup_object
@@ -275,15 +445,15 @@ class GenericTests(unittest.TestCase):
                 xs = [x + 36.0 for x in xs]
                 ys = [y + 21.2 for y in ys]
             seen.append((min(xs), max(xs), min(ys), max(ys)))
-            if min(ys) < 0 or max(ys) > 235 or min(xs) < 0 or max(xs) > 235:
+            if min(ys) < 0 or max(ys) > 200 or min(xs) < 0 or max(xs) > 235:
                 raise Err("LiDAR: the nozzle would go outside its travel")
         L._check_reach = reach
         calibrate(L)
         t = json.load(open(os.path.join(L.data_dir, "pa_flow_test.json")))
-        # the K1 Max spot (Y35 -> Y222 plus the laser strips) runs past the
-        # 235 mm bed's back: centred in the laser area instead
-        self.assertNotEqual(t["flow"]["y0"], 35.0)
-        self.assertTrue(all(b[3] <= 235 for b in seen[-2:]), seen)
+        # the K1 Max spot (X100 Y35, plus the laser strips) runs past the
+        # 200 mm bed's back: centred in the travel instead
+        self.assertNotEqual(t["area"][1], 33.0)
+        self.assertTrue(all(b[3] <= 200 for b in seen[-2:]), seen)
 
 
 class OffsetTests(unittest.TestCase):

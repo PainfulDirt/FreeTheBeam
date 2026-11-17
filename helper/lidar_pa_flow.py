@@ -4,18 +4,25 @@ against its travel / keep-out / skew (it has the Klipper objects), writes
 the G-code and runs it.
 
 plan_pa_flow: LIDAR_PA_FLOW_CALIBRATE, one print for pressure advance (photo
-widths at the speed changes of 9 PA lines) and flow (photo widths of 4
-triplets of lines at 90/100/110 %, the gap from bare LiDAR strips).
+widths at the speed changes of 9 PA lines) and/or flow (6 one-layer bands
+at 92..112 %, judged by the camera, the LiDAR or both: lidar_bands.py).
 plan_offset_cross: LIDAR_OFFSET_CALIBRATE's 1-layer cross.
 Background: docs/camera.md
 
 This file may be distributed under the terms of the GNU GPLv3 license.
 """
+import math
+
 H_NOM, W_NOM = 0.2, 0.45
 PA_PITCH, PA_LINES = 2.5, 9
 PA_SEGS = [(15.0, 20.0), (20.0, 150.0), (15.0, 20.0), (20.0, 150.0),
            (15.0, 20.0), (20.0, 150.0), (15.0, 20.0)]
-TRI_PITCH, GROUP_PITCH, GROUPS, TRI_LEN = 1.5, 6.0, 4, 50.0
+BAND_FLOWS = [0.92, 0.96, 1.00, 1.04, 1.08, 1.12]
+BAND_W, BAND_H, BAND_GAP = 14.0, 10.0, 4.0
+BAND_SP = W_NOM - H_NOM * (1 - math.pi / 4)     # the slicer's line spacing
+BAND_EXPOSURE = 1000          # lidar_bands.CAMERA_EXPOSURE (no numpy here)
+PA_AFTER_BANDS = 25.0         # PA lines start this far behind Y
+PRIME_LEN = 50.0
 
 
 def _q(v):
@@ -39,53 +46,92 @@ def _segments(g):
     return segs
 
 
+def _band_gcode(b, speed, fil_area):
+    """One 1-layer band: lines along Y at the slicer's spacing, E scaled by
+    the band's flow (M221 stays 100)."""
+    epm = BAND_SP * H_NOM / fil_area * b["flow"]
+    g = ["G0 Z1 F600"]
+    for k in range(int(BAND_W / BAND_SP)):
+        cx = b["x0"] + BAND_SP * (k + 0.5)
+        ya, yb = (b["y0"], b["y1"]) if k % 2 == 0 else (b["y1"], b["y0"])
+        if k == 0:
+            g += ["G0 X%.3f Y%.3f F9000" % (cx, ya), "G0 Z%.3f F600" % H_NOM,
+                  "G1 E0.8 F2400"]
+        else:
+            g.append("G1 X%.3f Y%.3f E%.5f F%.0f" % (cx, ya, BAND_SP * epm,
+                                                      speed * 60))
+        g.append("G1 X%.3f Y%.3f E%.5f F%.0f" % (cx, yb, BAND_H * epm,
+                                                  speed * 60))
+    return g + ["G1 E-0.8 F2400"]
+
+
 def plan_pa_flow(p):
+    """tests: ["pa"], ["flow"] or both; pa_method / flow_method: "ir"
+    (camera photos), "lidar" (bare + printed LiDAR strips) or "both"
+    (benchmark)."""
     X, Y = float(p.get("x", 100.0)), float(p.get("y", 35.0))
     temp, bed = float(p["extruder_temp"]), float(p["bed_temp"])
-    flows = [float(f) for f in p.get("flows", [0.9, 1.0, 1.1])]
+    tests = [t for t in ("pa", "flow") if t in p.get("tests", ["pa", "flow"])]
+    method = p.get("flow_method", "ir")
+    pa_method = p.get("pa_method", "ir")
+    flows = [float(f) for f in p.get("flows") or BAND_FLOWS]
     speed = float(p.get("speed", 40.0))
     pa_keep = float(p.get("pa_keep", 0.0))
-    epm = H_NOM * W_NOM / float(p["fil_area"])
+    fil = float(p["fil_area"])
+    epm = H_NOM * W_NOM / fil
+    test = {"version": 2, "tests": tests, "photos": [], "strips": [],
+            "filament_name": p.get("filament_name", ""),
+            "filament_type": p.get("filament_type", ""),
+            "extruder_temp": temp, "bed_temp": bed, "pa_keep": pa_keep}
+    x1o, y1o = X + 24.0, Y + PRIME_LEN + 2.0
+    if "flow" in tests:
+        bands = [{"name": "B%d" % (i + 1), "flow": f,
+                  "x0": X + i * (BAND_W + BAND_GAP),
+                  "x1": X + i * (BAND_W + BAND_GAP) + BAND_W,
+                  "y0": Y, "y1": Y + BAND_H} for i, f in enumerate(flows)]
+        test["flow"] = {"bands": bands, "method": method, "height": H_NOM,
+                        "spacing": round(BAND_SP, 4), "speed": speed,
+                        "exposure": BAND_EXPOSURE}
+        mids = [((b["x0"] + b["x1"]) / 2, Y + BAND_H / 2) for b in bands]
+        if method in ("ir", "both"):
+            test["photos"] += [{"name": b["name"], "x": mx, "y": my,
+                                "exposure": BAND_EXPOSURE}
+                               for b, (mx, my) in zip(bands, mids)]
+        if method in ("lidar", "both"):
+            test["strips"] = [{"name": "pf_b%d" % (i + 1), "x": mx,
+                               "y0": Y - 2.0, "y1": Y + BAND_H + 2.0}
+                              for i, (mx, my) in enumerate(mids)]
+        x1o = max(x1o, bands[-1]["x1"] + 2.0)
+        y1o = max(y1o, Y + BAND_H + 2.0)
+    y0p = Y + PA_AFTER_BANDS if "flow" in tests else Y
+    y1p = y0p + sum(s[0] for s in PA_SEGS)
     pas = [round(float(p.get("pa_start", 0.0)) + i * float(p.get("pa_step", 0.01)), 4)
            for i in range(PA_LINES)]
-    groups = []
-    for k in range(GROUPS):
-        order = flows[-k % len(flows):] + flows[:-k % len(flows)] if k else flows
-        gx = X + GROUP_PITCH * k
-        groups.append({"k": k, "center": round(gx + TRI_PITCH, 3),
-                       "lines": [{"x": round(gx + TRI_PITCH * j, 3), "flow": f}
-                                 for j, f in enumerate(order)]})
-    y0p = Y + 65.0
-    y1p = y0p + sum(s[0] for s in PA_SEGS)
     dirs = [1 if i % 2 == 0 else -1 for i in range(PA_LINES)]
-    changes, yy = [], y0p
-    for seglen, _ in PA_SEGS[:-1]:
-        yy += seglen
-        changes.append(yy)
-    test = {
-        "version": 1,
-        "pa": {"x0": X, "pitch": PA_PITCH, "y0": y0p, "y1": y1p, "pa": pas,
-               "dirs": dirs, "segments": PA_SEGS, "fast": 150.0, "slow": 20.0,
-               "height": H_NOM, "width": W_NOM},
-        "flow": {"y0": Y, "y1": Y + TRI_LEN, "speed": speed, "height": H_NOM,
-                 "width": W_NOM, "groups": groups},
-        "strips": [{"name": "pf_g%d" % g["k"], "x": g["center"], "y0": Y - 2.0,
-                    "y1": Y + TRI_LEN + 2.0} for g in groups],
-        "pa_strip": {"name": "pf_pa", "x": X + 10.0, "y0": y0p - 3.0,
-                     "y1": y1p + 3.0},
-        "photos": [{"name": "F%d" % (i + 1), "x": X + 10.5, "y": Y + dy}
-                   for i, dy in enumerate((12.0, 25.0, 38.0))]
-        + [{"name": "T%d" % (i + 1), "x": X + 10.0, "y": c}
-           for i, c in enumerate(changes)],
-        "plate_photo": {"x": X + 10.0, "y": Y + 125.0},
-        "filament_name": p.get("filament_name", ""),
-        "filament_type": p.get("filament_type", ""),
-        "extruder_temp": temp, "bed_temp": bed, "pa_keep": pa_keep,
-    }
-    x0o, y0o, x1o, y1o = X - 14.0, Y - 2.0, X + 24.0, y1p + 2.0
-    g = ["; LiDAR PA + flow calibration (helper/lidar_pa_flow.py)",
-         "; PA %s, flows %s" % (" ".join("%.3f" % v for v in pas),
-                                "/".join("%.0f" % (f * 100) for f in flows)),
+    if "pa" in tests:
+        changes, yy = [], y0p
+        for seglen, _ in PA_SEGS[:-1]:
+            yy += seglen
+            changes.append(yy)
+        test["pa"] = {"x0": X, "pitch": PA_PITCH, "y0": y0p, "y1": y1p,
+                      "pa": pas, "dirs": dirs, "segments": PA_SEGS,
+                      "fast": 150.0, "slow": 20.0, "height": H_NOM,
+                      "width": W_NOM, "method": pa_method}
+        test["pa_strip"] = {"name": "pf_pa", "x": X + 10.0, "y0": y0p - 3.0,
+                            "y1": y1p + 3.0}
+        if pa_method in ("ir", "both"):
+            test["photos"] += [{"name": "T%d" % (i + 1), "x": X + 10.0,
+                                "y": c} for i, c in enumerate(changes)]
+        test["plate_photo"] = {"x": X + 10.0, "y": y0p + 60.0}
+        y1o = max(y1o, y1p + 2.0)
+    else:
+        test["plate_photo"] = {"x": X + 7.0, "y": Y + BAND_H / 2}
+    x0o, y0o = X - 14.0, Y - 2.0
+    test["area"] = [x0o, y0o, x1o, y1o]
+    what = " and ".join({"pa": "PA (%s)" % (pa_method,),
+                         "flow": "flow (%s)" % (method,)}[t]
+                        for t in tests)
+    g = ["; LiDAR %s calibration (helper/lidar_pa_flow.py)" % (what,),
          "SET_PRINT_STATS_INFO TOTAL_LAYER=1",
          "EXCLUDE_OBJECT_DEFINE NAME=lidar_pa_flow CENTER=%.1f,%.1f"
          " POLYGON=[[%.1f,%.1f],[%.1f,%.1f],[%.1f,%.1f],[%.1f,%.1f]]" % (
@@ -104,29 +150,28 @@ def plan_pa_flow(p):
          # prime line, outside the photos
          "G0 Z1 F600", "G0 X%.3f Y%.3f F9000" % (X - 12.0, Y),
          "G0 Z%.3f F600" % H_NOM, "G1 E1.6 F2400",
-         "G1 X%.3f Y%.3f E%.5f F1200" % (X - 12.0, Y + TRI_LEN,
-                                         TRI_LEN * epm * 1.2),
+         "G1 X%.3f Y%.3f E%.5f F1200" % (X - 12.0, Y + PRIME_LEN,
+                                         PRIME_LEN * epm * 1.2),
          "G1 E-0.8 F2400"]
-    for grp in groups:
-        for ln in grp["lines"]:
-            g += ["G0 Z1 F600", "G0 X%.3f Y%.3f F9000" % (ln["x"], Y),
-                  "G0 Z%.3f F600" % H_NOM, "G1 E0.8 F2400",
-                  "G1 X%.3f Y%.3f E%.5f F%.0f" % (
-                      ln["x"], Y + TRI_LEN, TRI_LEN * epm * ln["flow"],
-                      speed * 60),
-                  "G1 E-0.8 F2400"]
-    g += ["G0 Z1 F600", "G0 X%.3f Y%.3f F9000" % (X, y0p),
-          "G0 Z%.3f F600" % H_NOM, "G1 E0.8 F2400"]
-    for i, pa in enumerate(pas):
-        x = X + i * PA_PITCH
-        y = y0p if dirs[i] > 0 else y1p
-        g.append("SET_PRESSURE_ADVANCE ADVANCE=%.4f" % pa)
-        for seglen, v in (PA_SEGS if dirs[i] > 0 else list(reversed(PA_SEGS))):
-            y += dirs[i] * seglen
-            g.append("G1 X%.3f Y%.3f E%.5f F%.0f" % (x, y, seglen * epm, v * 60))
-        if i + 1 < PA_LINES:
-            g.append("G1 X%.3f E%.5f F1200" % (x + PA_PITCH, PA_PITCH * epm))
-    g += ["G1 E-0.8 F2400", "G0 Z3 F600",
+    if "flow" in tests:
+        g.append("; bands %s" % "/".join("%.0f" % (f * 100) for f in flows))
+        for b in test["flow"]["bands"]:
+            g += _band_gcode(b, speed, fil)
+    if "pa" in tests:
+        g += ["; PA %s" % " ".join("%.3f" % v for v in pas),
+              "G0 Z1 F600", "G0 X%.3f Y%.3f F9000" % (X, y0p),
+              "G0 Z%.3f F600" % H_NOM, "G1 E0.8 F2400"]
+        for i, pa in enumerate(pas):
+            x = X + i * PA_PITCH
+            y = y0p if dirs[i] > 0 else y1p
+            g.append("SET_PRESSURE_ADVANCE ADVANCE=%.4f" % pa)
+            for seglen, v in (PA_SEGS if dirs[i] > 0 else list(reversed(PA_SEGS))):
+                y += dirs[i] * seglen
+                g.append("G1 X%.3f Y%.3f E%.5f F%.0f" % (x, y, seglen * epm, v * 60))
+            if i + 1 < PA_LINES:
+                g.append("G1 X%.3f E%.5f F1200" % (x + PA_PITCH, PA_PITCH * epm))
+        g.append("G1 E-0.8 F2400")
+    g += ["G0 Z3 F600",
           "EXCLUDE_OBJECT_END NAME=lidar_pa_flow", "M106 S0",
           "SET_PRESSURE_ADVANCE ADVANCE=%.4f" % pa_keep,
           "SET_VELOCITY_LIMIT ACCEL=%.0f" % float(p.get("max_accel", 5000.0)),
@@ -137,10 +182,14 @@ def plan_pa_flow(p):
           "LIDAR_PA_FLOW_STEP STEP=PHOTOS",
           "END_PRINT",
           "LIDAR_PA_FLOW_STEP STEP=ANALYZE"]
-    lsegs = [(s["x"], s["y0"], s["x"], s["y1"])
-             for s in test["strips"] + [test["pa_strip"]]]
+    lsegs = [(s["x"], s["y0"], s["x"], s["y1"]) for s in test["strips"]]
+    if "pa_strip" in test:
+        s = test["pa_strip"]
+        lsegs.append((s["x"], s["y0"], s["x"], s["y1"]))
     lsegs += [(ph["x"], ph["y"], ph["x"], ph["y"])
               for ph in test["photos"] + [test["plate_photo"]]]
+    if "flow" in tests:     # the camera/strip positions of every band
+        lsegs += [(mx, my, mx, my) for mx, my in mids]
     return {"gcode": g, "test": test, "segments": _segments(g),
             "laser_segments": lsegs}
 

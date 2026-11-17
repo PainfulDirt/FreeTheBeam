@@ -28,16 +28,23 @@ def load_gray(data):
     return np.asarray(Image.open(io.BytesIO(data)).convert("L"), dtype=float)
 
 
-def _profile(img):
-    """Column profile over the middle of the picture, plate level removed,
-    sign chosen so lines are positive (bright or dark lines)."""
+def _profile_sign(img):
+    """(profile, sign): the column profile over the middle of the picture,
+    plate level removed, times sign (+1 bright lines, -1 dark lines on a
+    bright plate) so lines are positive."""
     h = img.shape[0]
     prof = np.median(img[h // 12:h - h // 12], axis=0)
     bg = np.percentile(prof, 20)
     p = prof - bg
     if -p.min() > p.max():          # dark lines on a bright plate
-        p = -p
-    return p
+        return -p, -1.0
+    return p, 1.0
+
+
+def _profile(img):
+    """Column profile over the middle of the picture, plate level removed,
+    sign chosen so lines are positive (bright or dark lines)."""
+    return _profile_sign(img)[0]
 
 
 def _peaks(p, rel, merge=20):
@@ -89,7 +96,7 @@ def line_widths(img, col, half=25, side=(18, 32)):
     following a tilted line. Edges at half way between the plate beside the
     line and the line's plateau, linear sub-pixel. Rows where the line is
     weaker than MIN_CONTRAST are left out."""
-    sign = 1.0 if _profile(img).max() >= 0 else -1.0
+    sign = _profile_sign(img)[1]     # dark lines: measured on -img
     h, w = img.shape
     c = int(round(col))
     out = []

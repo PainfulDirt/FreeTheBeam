@@ -62,27 +62,29 @@
 #       Run again after LIDAR_DRIVER
 #   LIDAR_PA_ANALYZE BASE= SCAN= [APPLY=1]
 #       compares the scan of the printed PA test with the bare-plate scan
-#   LIDAR_PA_CALIBRATE EXTRUDER_TEMP= BED_TEMP= [PA_START=0] [PA_STEP=0.01]
-#       [LINES=9] [X=130] [Y=100]
-#       with the helper and the camera: LIDAR_PA_FLOW_CALIBRATE. Otherwise
-#       writes the LiDAR PA test as a print and starts it: START_PRINT (with
-#       the bare-plate scan after the nozzle touch, before the purge), the
-#       test lines, cool down, scan, analysis, END_PRINT
-#   LIDAR_PA_FLOW_CALIBRATE EXTRUDER_TEMP= [BED_TEMP=60] [FILAMENT_NAME=]
-#       [FILAMENT_TYPE=] [X=100] [Y=35] [PA_START=0] [PA_STEP=0.01]
-#       [FLOWS=0.90,1.00,1.10] [SPEED=40] [FLOW_SAVE=0]   (helper + camera)
-#       one print for PA and flow: 9 PA lines and 4 triplets of flow lines,
-#       photographed by the module's IR camera (line widths), the gap under
-#       the triplets from bare LiDAR strips taken inside START_PRINT
-#       (_LIDAR_PRINT_SCAN -> LIDAR_PA_FLOW_STEP). PA is saved (lidar_pa);
-#       needs contrast between filament and plate (tested: white matte PLA
-#       on black PEI), else the LiDAR strips (bright plates) or nothing.
-#       The flow is EXPERIMENTAL (read ~4 % low against a printed check):
-#       reported, saved per filament (lidar_flow, applied by
-#       _LIDAR_FLOW_APPLY) only with FLOW_SAVE=1. Plate X-14..X+24,
-#       Y-2..Y+187 (nozzle; with the laser's strips the nozzle needs ~Y-15
-#       ..Y+210); X=/Y= default to the K1 Max spot if it fits, else
-#       centred in the travel
+#   LIDAR_PA_CALIBRATE EXTRUDER_TEMP= BED_TEMP= [METHOD=IR|LIDAR|BOTH]
+#       [PA_START=0] [PA_STEP=0.01] [LINES=9] [X=130] [Y=100]
+#       with the helper (not in local mode): LIDAR_PA_FLOW_CALIBRATE
+#       TESTS=PA PA_METHOD=METHOD (IR needs the camera). Otherwise writes
+#       the LiDAR PA test as a print and starts it: START_PRINT (with the
+#       bare-plate scan after the nozzle touch, before the purge), the test
+#       lines, cool down, scan, analysis, END_PRINT
+#   LIDAR_PA_FLOW_CALIBRATE TESTS=PA|FLOW|PA,FLOW PA_METHOD=IR|LIDAR|BOTH
+#       FLOW_METHOD=IR|LIDAR|BOTH EXTRUDER_TEMP= [BED_TEMP=60]
+#       [FILAMENT_NAME=] [FILAMENT_TYPE=] [X=100] [Y=35] [PA_START=0]
+#       [PA_STEP=0.01] [FLOWS=0.92,...,1.12]   (helper, numpy/PIL)
+#       PA lines and/or one-layer flow bands as a print, measured by the
+#       camera (IR), LiDAR strips or both (benchmark: nothing saved,
+#       LIDAR_PA_SAVE / LIDAR_FLOW_SAVE METHOD=IR|LIDAR pick). The flow is
+#       EXPERIMENTAL: FLOW_METHOD defaults to BOTH (nothing saved).
+#       X=/Y= default to the K1 Max spot if it fits, else centred in the
+#       travel. Buttons: lidar.example.cfg LIDAR_PA_CALIBRATION /
+#       LIDAR_FLOW_CALIBRATION METHOD=
+#   LIDAR_PA_SAVE / LIDAR_FLOW_SAVE METHOD=IR|LIDAR [FORCE=1]
+#       save the PA / the filament's flow from the last benchmark
+#   LIDAR_PLATE [NAME=] [RESET_RUNS=1]
+#       which build plate is on: grid calibration tables are kept per plate
+#       (lidar_plate); without NAME= lists the plates and their tables
 #   LIDAR_OFFSET_CALIBRATE EXTRUDER_TEMP= BED_TEMP= [X=150] [Y=150]
 #       [Z1=3] [Z2=5] [APPLY=1]
 #       prints a small cross (nozzle at X/Y = its centre), scans it at Z1
@@ -118,8 +120,8 @@
 #       nozzle touches the bed (load cells), then the laser looks at the same
 #       spot: LiDAR - nozzle is saved as lidar_twist for LIDAR_BED_MESH.
 #       Also logs the LiDAR distance with the nozzle on the bed
-#       (lidar_zero_log, data only). Wrapped by LIDAR_TWIST_CALIBRATION
-#       (lidar.example.cfg: nozzle temperature, wipe, bed heater off)
+#       (lidar_zero_log, data only). Wrapped by LIDAR_MESH_CALIBRATION
+#       AXIS=X|Y (lidar.example.cfg: nozzle temperature, wipe, bed heater off)
 #   LIDAR_BED_MESH [LEVEL=1-5 | MODE=quick|fast|normal|fine|ultimate]
 #       [MOTION=continuous|dwell] [X0= X1= Y0= Y1=] [ADAPTIVE=0]
 #       [COUNT_X= COUNT_Y=] [PROFILE=lidar] [TWIST=1] [HALF_X=3]
@@ -164,15 +166,19 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import array
+import errno
 import json
+import logging
 import math
 import os
+import re
+import select
 import socket
 import sys
 import time
 
 # FreeTheBeam release (also in driver/lidar_serial.py and CHANGELOG.md)
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 ETX = b"\x03"
 NAN = float("nan")
@@ -371,35 +377,34 @@ def quad_eval(c, x, y):
 
 
 def plane_fit(pts):
-    """Least squares d = a + b*x + c*y through (x, y, d) points."""
-    n = sx = sy = sd = sxx = sxy = syy = sxd = syd = 0.0
-    for x, y, d in pts:
-        n += 1
-        sx += x
-        sy += y
-        sd += d
-        sxx += x * x
-        sxy += x * y
-        syy += y * y
-        sxd += x * d
-        syd += y * d
-    m = [[n, sx, sy], [sx, sxx, sxy], [sy, sxy, syy]]
-    r = [sd, sxd, syd]
-
-    def det(a):
-        return (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
-                - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
-                + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
-    dm = det(m)
-    if abs(dm) < 1e-12:
+    """Least squares d = a + b*x + c*y through (x, y, d) points. None when
+    the points don't span a plane (all on one line, e.g. one scan row)."""
+    pts = list(pts)
+    n = len(pts)
+    if n < 3:
         return None
-    out = []
-    for c in range(3):
-        mc = [row[:] for row in m]
-        for i in range(3):
-            mc[i][c] = r[i]
-        out.append(det(mc) / dm)
-    return out
+    # centred sums: the singularity check is relative to the spread
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    md = sum(p[2] for p in pts) / n
+    sxx = sxy = syy = sxd = syd = 0.0
+    for x, y, d in pts:
+        u, v, w = x - mx, y - my, d - md
+        sxx += u * u
+        sxy += u * v
+        syy += v * v
+        sxd += u * w
+        syd += v * w
+    # a spread of rounding errors only (all x or all y the same) is none
+    if sxx <= 1e-12 * n * (mx * mx + 1.0) or \
+            syy <= 1e-12 * n * (my * my + 1.0):
+        return None
+    dm = sxx * syy - sxy * sxy
+    if dm <= 1e-9 * sxx * syy:
+        return None
+    b = (sxd * syy - syd * sxy) / dm
+    c = (syd * sxx - sxd * sxy) / dm
+    return [md - b * mx - c * my, b, c]
 
 
 def cross_fit(scan, test, tick=None):
@@ -732,31 +737,93 @@ def average_tables(tabs, key):
         for p in pts]}
 
 
-def tables_for_temp(store, temp):
+def plate_of(run):
+    """The plate (LIDAR_PLATE) a calibration run or table was made on; None
+    for untagged ones (made before plates or with none set)."""
+    return run.get("plate") if isinstance(run, dict) else None
+
+
+def tables_for_temp(store, temp, plate=None):
     """The LiDAR tables for bed temperature temp from lidar_cal_by_temp
     ({"70": {"runs": [{"twist": ..., "ytwist": ...}, ...]}, ...}): the
     weighted mean of every run of its group (hot: bed >= CAL_HOT, else
     cold; per table, the other group's if its own has none). Between 60 and 100C the
     tables agreed within the scatter between runs (2026-11-01), so more
-    runs beat picking the nearest temperature. Returns (twist, ytwist,
-    note)."""
+    runs beat picking the nearest temperature. With a plate: only its
+    runs, untagged runs only where a group has none of it, other plates'
+    never. Returns (twist, ytwist, note)."""
     runs = [(float(t), r) for t, e in (store or {}).items()
             for r in cal_runs(e)]
     hot = temp >= CAL_HOT
     out, notes = [], []
     for name, key in (("twist", "xs"), ("ytwist", "ys")):
         have = [x for x in runs if x[1].get(name)]
-        group = [x for x in have if (x[0] >= CAL_HOT) == hot] or have
+        untagged = False
+        if plate is None:
+            group = [x for x in have if (x[0] >= CAL_HOT) == hot] or have
+        else:
+            group = []
+            for same in (True, False):
+                g = [x for x in have if ((x[0] >= CAL_HOT) == hot) == same]
+                mine = [x for x in g if plate_of(x[1]) == plate]
+                group = mine or [x for x in g if plate_of(x[1]) is None]
+                if group:
+                    untagged = not mine
+                    break
         tabs = [(r[name], float(r[name].get("w", 1))) for t, r in group]
         if not tabs:
             out.append(None)
             continue
         out.append(average_tables(tabs, key))
         temps = sorted(set(t for t, r in group))
-        notes.append("%s %d run%s (%sC)" % (
-            name, len(tabs), "" if len(tabs) == 1 else "s",
+        notes.append("%s %d %srun%s (%sC)" % (
+            name, len(tabs), "untagged " if untagged else "",
+            "" if len(tabs) == 1 else "s",
             "/".join("%.0f" % t for t in temps)))
     return out[0], out[1], ", ".join(notes)
+
+
+PLATE_NAME = re.compile(r"[a-z0-9_]{1,32}\Z")
+
+
+def plate_runs(store):
+    """{plate (None: untagged): {temperature: [run times]}} of
+    lidar_cal_by_temp."""
+    out = {}
+    for t, e in (store or {}).items():
+        for r in cal_runs(e):
+            out.setdefault(plate_of(r), {}).setdefault(t, []).append(
+                r.get("time") or "")
+    return out
+
+
+def drop_plate_runs(store, plate):
+    """lidar_cal_by_temp without the runs of plate and the untagged ones
+    (everything when plate is None)."""
+    out = {}
+    if plate is None:
+        return out
+    for t, e in (store or {}).items():
+        keep = [r for r in cal_runs(e) if plate_of(r) not in (None, plate)]
+        if keep:
+            out[t] = {"runs": keep}
+    return out
+
+
+RESCAN_SHARE = 0.3   # a column with fewer frames than this share of the
+RESCAN_MAX = 2       # median column is scanned again (at most this many)
+
+
+def poor_columns(xs, kept):
+    """Columns of a moving scan to scan again: fewer kept frames
+    ({x: n}) than RESCAN_SHARE of the median column (and at least the 2
+    mesh_points needs); none if more than RESCAN_MAX are (not a hiccup
+    then)."""
+    if not xs:
+        return []
+    need = max(2.0, RESCAN_SHARE * median([kept[x] for x in xs]))
+    poor = [x for x in xs if kept[x] < need]
+    return poor if len(poor) <= RESCAN_MAX else []
 
 
 def _table_at(xs, comp, x):
@@ -1237,9 +1304,54 @@ def fl_plan(objects, margin, lo, hi, step, row_s=0.25, strip_s=2.5,
         est = n * (rows * row_s + strip_s)
         if est <= max_time:
             break
-    return {"strips": [round(x, 2) for x in strips], "y0": round(ay0, 2),
-            "y1": round(ay0 + (rows - 1) * s, 2), "step": s,
-            "est": round(est, 1)}
+    y0, rows = _rows_in(ay0, rows, s, lo[1], hi[1])
+    return {"strips": [round(x, 2) for x in strips], "y0": y0,
+            "y1": round(y0 + (rows - 1) * s, 2), "step": s,
+            "est": round(n * (rows * row_s + strip_s), 1)}
+
+
+def _rows_in(y0, rows, s, lo, hi):
+    """(first row, rows): rows every s from y0, the last one not past hi
+    (rounded up it can overshoot by a step): moved back towards lo, else
+    one row less."""
+    y0 = round(y0, 2)
+    if y0 + (rows - 1) * s > hi + 1e-6:
+        y0 = round(max(lo, hi - (rows - 1) * s), 2)
+        while rows > 1 and round(y0 + (rows - 1) * s, 2) > hi + 1e-6:
+            rows -= 1
+    return y0, rows
+
+
+def fl_prime_plan(objects, tip, purge, height, flow, fits, margin=8.0,
+                  flick=10.0, min_len=10.0, edge=5.0):
+    """Where to prime before layer 2 of the first-layer check: a purge line
+    like KAMP's start purge (1 mm of line per mm of filament, at its height
+    and speed: flow / 5 mm/s), `margin` mm in front of the objects, else
+    left of, right of or behind them; the first side whose line and string
+    flick fits(segments) accepts. None: no objects, nothing to purge or no
+    side fits."""
+    pts = [p for o in objects or [] for p in o["polygon"]]
+    if not pts or tip + purge <= 0:
+        return None
+    x0, x1 = min(p[0] for p in pts), max(p[0] for p in pts)
+    y0, y1 = min(p[1] for p in pts), max(p[1] for p in pts)
+    cx, cy, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, max(purge, min_len) / 2.0
+    sides = [("front", (cx - h, y0 - margin, cx + h, y0 - margin), (1, 0)),
+             ("left", (x0 - margin, cy - h, x0 - margin, cy + h), (0, 1)),
+             ("right", (x1 + margin, cy - h, x1 + margin, cy + h), (0, 1)),
+             ("back", (cx - h, y1 + margin, cx + h, y1 + margin), (1, 0))]
+    for side, (a, b, c, d), (dx, dy) in sides:
+        if min(a, b, c, d) < edge:
+            continue
+        line = tuple(round(v, 3) for v in (a, b, c, d))
+        fl = (line[2], line[3], round(c + flick * dx, 3),
+              round(d + flick * dy, 3))
+        if fits([line, fl]):
+            return {"side": side, "x0": line[0], "y0": line[1],
+                    "x1": line[2], "y1": line[3], "fx": fl[2], "fy": fl[3],
+                    "tip": tip, "purge": purge, "z": height,
+                    "feed": flow / 5.0 * 60.0}
+    return None
 
 
 def _in_poly(x, y, poly):
@@ -1314,12 +1426,22 @@ def fl_analyze(plan, before, after, cell=0.5, erode=2.0, bare_gap=3.0,
     polys = [o["polygon"] for o in plan["objects"]]
     # where each cell is: (object index or -1, distance to that outline);
     # bare = outside every object by more than bare_gap
+    # (only cells near an outline's box get the exact distance: further
+    # than `far` the box distance is enough, a full plate of round parts
+    # took ~15 s without this)
+    far = max(bare_gap, erode) + 1.0
+    boxes = [(min(q[0] for q in p), min(q[1] for q in p),
+              max(q[0] for q in p), max(q[1] for q in p)) for p in polys]
     where = []
     for y in ys:
+        near_y = [(i, p, b) for i, (p, b) in enumerate(zip(polys, boxes))
+                  if b[1] - far <= y <= b[3] + far]
         wrow = []
         for x in cx:
             k, d = -1, 1e9
-            for i, p in enumerate(polys):
+            for i, p, b in near_y:
+                if x < b[0] - far or x > b[2] + far:
+                    continue
                 di = _poly_dist(x, y, p)
                 if _in_poly(x, y, p):
                     k, d = i, di
@@ -1338,10 +1460,16 @@ def fl_analyze(plan, before, after, cell=0.5, erode=2.0, bare_gap=3.0,
     # robust plane: twice, dropping what is far off (strings, blobs)
     pl = plane_fit(bare)
     for it in range(2):
+        if pl is None:
+            break
         r = [p[2] - (pl[0] + pl[1] * p[0] + pl[2] * p[1]) for p in bare]
         mad = median([abs(v) for v in r]) or 1e-3
         bare = [p for p, v in zip(bare, r) if abs(v) <= 4.0 * mad + 0.005]
         pl = plane_fit(bare)
+    if pl is None:
+        res["reason"] = "the bare plate around the print is a single line" \
+            " of cells (no plane to take off)"
+        return res, None
     # The plate's change between the scans can be curved: a bowl of ~30 um
     # across X and Y, the middle lower, on every 9-pad test print
     # (2026-11-01/02; the bare plate between the pads showed it as well as
@@ -1448,7 +1576,12 @@ def fl_analyze(plan, before, after, cell=0.5, erode=2.0, bare_gap=3.0,
         if w:
             objs.append({"name": o.get("name", str(i)), "cells": len(w),
                          "median": round(median(w), 4)})
-    tilt = plane_fit([(p[0], p[1], p[2]) for p in printed])
+    # the layer's tilt needs cells in 2+ rows and columns (a narrow part
+    # can sit in one scan row: no Y tilt to fit, None)
+    tilt = None
+    if len(set(p[0] for p in printed)) >= 2 and \
+            len(set(p[1] for p in printed)) >= 2:
+        tilt = plane_fit([(p[0], p[1], p[2]) for p in printed])
     # coarse residual map (thickness - median) for the learned mesh
     # correction: thicker = nozzle too high there
     cm = {}
@@ -1504,8 +1637,9 @@ def skew_plan(box, margin, lo, hi, step, width=28.0, spacing=26.0):
     strips = [round(min(max(c - span / 2.0 + i * spacing, lo[0]), hi[0]), 2)
               for i in range(n)]
     rows = int(math.ceil((ay1 - ay0) / step)) + 1
-    return {"strips": strips, "y0": round(ay0, 2),
-            "y1": round(ay0 + (rows - 1) * step, 2), "step": step,
+    y0, rows = _rows_in(ay0, rows, step, lo[1], hi[1])
+    return {"strips": strips, "y0": y0,
+            "y1": round(y0 + (rows - 1) * step, 2), "step": step,
             "est": round(n * (rows * 0.23 + 2.5), 1)}
 
 
@@ -2045,10 +2179,15 @@ class Lidar:
         self.sock = None
         # optional helper computer running lidar_service.py ("host:port"):
         # the LiDAR captures and the analysis happen there, the K1 only
-        # moves the toolhead and forwards bytes (lidar-bridge.py)
+        # moves the toolhead and forwards bytes (lidar-bridge.py).
+        # 127.0.0.1 / localhost = the service on the printer itself (no
+        # helper computer; numpy-free work only): its analysis timeouts are
+        # scaled (svc_local, _svc_timeout)
         self.service = config.get("service", None)
         self.svc_sock = None
         self.svc_buf = b""
+        self.svc_down = None    # (until, why) after a failed connect
+        self.drv_buf = b""      # driver bytes after the last reply's ETX
         # name -> {"x", "ys", "rows"}; only the last few scans are kept
         self.scans = {}
         self.pa_test = None
@@ -2063,7 +2202,8 @@ class Lidar:
                     "LIDAR_GRID_CALIBRATE", "MESH_COMPARE", "MESH_BENCHMARK",
                     "FIRST_LAYER_SCAN", "SKEW_SCAN", "SKEW_CALIBRATE",
                     "LIDAR_SETUP_CHECK", "LIDAR_STREAM_MODE",
-                    "LIDAR_PA_FLOW_CALIBRATE", "LIDAR_PA_FLOW_STEP"):
+                    "LIDAR_PA_FLOW_CALIBRATE", "LIDAR_PA_FLOW_STEP",
+                    "LIDAR_FLOW_SAVE", "LIDAR_PA_SAVE", "LIDAR_PLATE"):
             fn = self._keyed(cmd, getattr(self, "cmd_" + cmd))
             if cmd in self.TEMP_LOGGED:
                 fn = self._temp_logged(cmd, fn)
@@ -2108,8 +2248,8 @@ class Lidar:
         """The module's exposure for this job (print or command): measured
         once by the helper (auto_exposure: dark / glossy plates need more
         light), set again for every later scan of the job. Without the
-        helper service the module keeps its exposure. Call with the LiDAR over the plate at
-        scan height."""
+        helper service the module keeps its exposure. Call with the LiDAR
+        over the plate at scan height."""
         if not self.service:
             return None
         key = self._job_key()
@@ -2153,12 +2293,15 @@ class Lidar:
             except OSError:
                 pass
         self.sock = None
+        self.drv_buf = b""
 
     def _call(self, msg, timeout=10.0):
         raw, t = self._call_raw(msg, timeout)
         try:
             return json.loads(raw.decode(errors="replace"))
         except ValueError as e:
+            # out of step with the driver: start over on a new connection
+            self._close()
             raise self.printer.command_error("LiDAR: bad reply (%s)" % (e,))
 
     def _send(self, msg):
@@ -2182,15 +2325,18 @@ class Lidar:
         s.sendall(data)
 
     def _recv(self, timeout=10.0):
-        """The reply bytes (without ETX) and the reactor time they arrived."""
-        buf = b""
+        """One reply's bytes (without ETX) and the reactor time they
+        arrived. Replies can come glued in one read: the rest waits in
+        drv_buf for the next call."""
+        buf = getattr(self, "drv_buf", b"")
         end = self.reactor.monotonic() + timeout
-        while not buf.endswith(ETX):
+        while ETX not in buf:
             try:
                 d = self.sock.recv(1 << 20)
                 if not d:
                     raise OSError("connection closed")
                 buf += d
+                self.drv_buf = buf
                 continue
             except (BlockingIOError, InterruptedError):
                 pass
@@ -2199,7 +2345,28 @@ class Lidar:
                 raise OSError("timeout")
             # wait without blocking the reactor
             self.reactor.pause(now + 0.002)
-        return buf[:-1], self.reactor.monotonic()
+        raw, self.drv_buf = buf.split(ETX, 1)
+        return raw, self.reactor.monotonic()
+
+    @staticmethod
+    def _reply_control(raw):
+        """The "control" a driver reply answers (lidar-direct.py puts it
+        first), None if it doesn't say (the middleware)."""
+        i = raw.find(b'"control": "', 0, 40)
+        if i < 0:
+            return None
+        j = raw.find(b'"', i + 12)
+        return raw[i + 12:j].decode(errors="replace") if j > 0 else None
+
+    @staticmethod
+    def _frame_ok(raw):
+        """A get_point_cloud reply with result code 0, not an error (True
+        when it carries no code at all)."""
+        i = raw.find(b'"code":', 0, 120)
+        if i < 0:
+            return True
+        v = raw[i + 7:i + 16].lstrip()
+        return v[:1] == b"0" and not v[1:2].isdigit()
 
     def _driver_error(self, err):
         self._close()
@@ -2210,10 +2377,17 @@ class Lidar:
     def _call_raw(self, msg, timeout=10.0):
         """Reply bytes (without ETX) and the reactor time they arrived."""
         err = None
+        want = msg.get("control")
         for attempt in range(2):
             try:
                 self._send(msg)
-                return self._recv(timeout)
+                end = self.reactor.monotonic() + timeout
+                while True:
+                    raw, t = self._recv(max(0.0, end - self.reactor.monotonic()))
+                    c = self._reply_control(raw)
+                    if c is None or c == want:
+                        return raw, t
+                    # a reply left over from an aborted request: skip it
             except OSError as e:
                 err = e
                 self._close()
@@ -2222,7 +2396,7 @@ class Lidar:
     def _frame_msg(self):
         """get_point_cloud for timed frames: with the direct driver the
         frames are streamed back-to-back by the driver and time-stamped."""
-        if self._driver() == "direct":
+        if self._driver() in ("direct", "direct-m1"):
             return {"control": "get_point_cloud", "prefetch": 1}
         return {"control": "get_point_cloud"}
 
@@ -2282,35 +2456,122 @@ class Lidar:
         self.svc_sock = None
         self.svc_buf = b""
 
-    def _svc_send(self, data, timeout=10.0):
-        # non-blocking send of a request that gets no reply (frames)
+    def _svc_write(self, data, timeout=10.0):
+        """Send all of data on the non-blocking socket, waiting in the
+        reactor while the send buffer is full (OSError)."""
         end = self.reactor.monotonic() + timeout
         view = memoryview(data)
+        while len(view):
+            try:
+                n = self.svc_sock.send(view)
+                view = view[n:]
+            except (BlockingIOError, InterruptedError):
+                now = self.reactor.monotonic()
+                if now > end:
+                    raise OSError("timeout")
+                self.reactor.pause(now + 0.002)
+
+    def _svc_send(self, data, timeout=10.0):
+        # non-blocking send of a request that gets no reply (frames)
         try:
-            while len(view):
-                try:
-                    n = self.svc_sock.send(view)
-                    view = view[n:]
-                except (BlockingIOError, InterruptedError):
-                    now = self.reactor.monotonic()
-                    if now > end:
-                        raise OSError("timeout")
-                    self.reactor.pause(now + 0.002)
+            self._svc_write(data, timeout)
         except OSError as e:
             self._svc_close()
             raise self.printer.command_error(
                 "LiDAR: lost the lidar service (%s)" % (e,))
 
+    SVC_RETRY = 30.0     # s: after a failed connect, fail fast until then
+
+    def _svc_connect(self, host, port, timeout=3.0):
+        """Non-blocking connect, the reactor polled meanwhile (the helper off
+        or out of Wi-Fi leaves the SYNs unanswered: a blocking connect froze
+        Klipper for 3 s). A failure is remembered for SVC_RETRY s, so the
+        next requests (several in one START_PRINT) fail at once."""
+        now = self.reactor.monotonic()
+        down = getattr(self, "svc_down", None)
+        if down is not None and now < down[0]:
+            raise OSError("%s, not retried for %.0fs" % (down[1],
+                                                         down[0] - now))
+        s = None
+        try:
+            ai = socket.getaddrinfo(host, int(port), 0, socket.SOCK_STREAM)
+            af, kind, proto, cn, addr = ai[0]
+            s = socket.socket(af, kind, proto)
+            s.setblocking(False)
+            err = s.connect_ex(addr)
+            end = now + timeout
+            poll = select.poll()
+            poll.register(s.fileno(), select.POLLOUT)
+            while err in (errno.EINPROGRESS, errno.EALREADY,
+                          errno.EWOULDBLOCK, errno.EINTR):
+                if poll.poll(0):
+                    err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    break
+                now = self.reactor.monotonic()
+                if now > end:
+                    err = errno.ETIMEDOUT
+                    break
+                self.reactor.pause(now + 0.01)
+            if err:
+                raise OSError(err, os.strerror(err))
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            if s is not None:
+                s.close()
+            self.svc_down = (self.reactor.monotonic() + self.SVC_RETRY,
+                             "connect failed (%s)" % (e,))
+            raise
+        self.svc_down = None
+        self.svc_sock = s
+        self.svc_buf = b""
+
+    def _svc_drain(self):
+        """Drop whatever came in before a request went out: every reply is
+        read by its request, so that is a stray one (it would shift every
+        later reply by one)."""
+        while True:
+            try:
+                d = self.svc_sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            if not d:
+                raise OSError("connection closed")
+            self.svc_buf += d
+        if self.svc_buf:
+            logging.info("lidar: dropped %d stray bytes from the service",
+                         len(self.svc_buf))
+            self.svc_buf = b""
+
+    @property
+    def svc_local(self):
+        """The service runs on this printer (service: 127.0.0.1:port)."""
+        return bool(self.service) and self.service.rsplit(":", 1)[0] in (
+            "127.0.0.1", "localhost")
+
+    SVC_LOCAL_MAX = 300.0
+
+    def _svc_timeout(self, timeout):
+        """A printer's slow CPU (the K1 Max's MIPS) runs the service's
+        analysis ~3x slower than a helper computer: longer requests wait
+        x3 (at most 300 s) in local mode."""
+        if self.svc_local and timeout > 10:
+            return min(timeout * 3, self.SVC_LOCAL_MAX)
+        return timeout
+
     def _svc(self, req, timeout=30.0):
         """One request to lidar_service.py, without blocking the reactor."""
+        timeout = self._svc_timeout(timeout)
         host, port = self.service.rsplit(":", 1)
         try:
+            if self.svc_sock is not None:
+                try:
+                    self._svc_drain()
+                except OSError:
+                    # closed by the other end (service restarted): again
+                    self._svc_close()
             if self.svc_sock is None:
-                s = socket.create_connection((host, int(port)), 3.0)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                s.setblocking(False)
-                self.svc_sock = s
-            self.svc_sock.sendall(json.dumps(req).encode() + b"\n")
+                self._svc_connect(host, port)
+            self._svc_write(json.dumps(req).encode() + b"\n", timeout)
             end = self.reactor.monotonic() + timeout
             while b"\n" not in self.svc_buf:
                 try:
@@ -2327,12 +2588,17 @@ class Lidar:
                 self.reactor.pause(now + 0.005)
             line, self.svc_buf = self.svc_buf.split(b"\n", 1)
             rep = json.loads(line.decode(errors="replace"))
+            if not isinstance(rep, dict):
+                raise ValueError("reply is not a JSON object")
         except (OSError, ValueError) as e:
             self._svc_close()
             raise self.printer.command_error(
                 "LiDAR: no answer from the lidar service at %s (%s)" % (
                     self.service, e))
         if not rep.get("ok"):
+            # a fresh connection for the next request: if this answered
+            # something else (out of step), nothing stale is left
+            self._svc_close()
             raise self.printer.command_error(
                 "LiDAR service: %s" % (rep.get("error"),))
         return rep
@@ -2488,9 +2754,14 @@ class Lidar:
                 VERSION, r.get("exposure"), self.x_offset,
                 self.y_offset, self.offset_z, self.x_per_z, self.y_per_z,
                 self.offset_source, self.x_dir,
+                "work done by the service on this printer (local)"
+                if self.svc_local else
                 "work done by the service at " + self.service
                 if self.service else "work done on this printer",
                 ", ".join(sorted(self.scans)) or "none"))
+        for line in self._plate_report(self._saved().get("lidar_plate"),
+                                       runs=False):
+            gcmd.respond_info(line)
 
     offset_source = "config"
 
@@ -2599,15 +2870,18 @@ class Lidar:
         rows = []
         start = self.reactor.monotonic()
         self.gcode.run_script_from_command(
-            "SAVE_GCODE_STATE NAME=_lidar_scan\nG90\nG0 Z%.3f F600" % (z,))
-        if self.service:
-            self._job_exposure()
-            self._svc({"cmd": "begin", "name": name, "x": x, "z": z,
-                       "x_dir": self.x_dir, "x_offset": xo,
-                       "y_offset": yo, "captures": captures})
-        else:
-            self._laser(True)
+            "SAVE_GCODE_STATE NAME=_lidar_scan")
         try:
+            # inside the try: a failing setup still restores the G-code
+            # state and switches the laser off
+            self.gcode.run_script_from_command("G90\nG0 Z%.3f F600" % (z,))
+            if self.service:
+                self._job_exposure()
+                self._svc({"cmd": "begin", "name": name, "x": x, "z": z,
+                           "x_dir": self.x_dir, "x_offset": xo,
+                           "y_offset": yo, "captures": captures})
+            else:
+                self._laser(True)
             for y in ys:
                 self.gcode.run_script_from_command(
                     "G0 X%.3f Y%.3f F%.0f" % (
@@ -2668,30 +2942,21 @@ class Lidar:
         level = self.scan_level if level is None else level
         period, lo, hi, src = self._timing(level)
         margin, settle = self.dwell_margin, self.dwell_settle
+        if path is None and not step > 0:
+            raise self.printer.command_error(
+                "LiDAR: the scan STEP must be above 0")
         if path is None:
             n = int(round(abs(y1 - y0) / step))
             d = step if y1 >= y0 else -step
             pts = [(x, round(y0 + i * d, 4)) for i in range(n + 1)]
         else:
             pts = [(round(px, 4), round(py, 4)) for px, py in path]
+        if not pts:
+            raise self.printer.command_error("LiDAR: nothing to scan")
         ys = [p[1] for p in pts]
         xo, yo = self._xo(z), self._yo(z)
         f = (speed or self.speed) * 60.0
         start = self.reactor.monotonic()
-        self.gcode.run_script_from_command(
-            "SAVE_GCODE_STATE NAME=_lidar_scan\nG90\nG0 Z%.3f F600\n"
-            "G0 X%.3f Y%.3f F%.0f" % (z, pts[0][0] - xo, ys[0] - yo,
-                                      self.speed * 60.0))
-        toolhead.wait_moves()
-        self._job_exposure()      # LiDAR over the plate at scan height now
-        req = {"cmd": "begin", "name": name, "x": x, "z": z,
-               "x_dir": self.x_dir, "x_offset": xo, "y_offset": yo,
-               "captures": 1, "level": level}
-        if path is None:
-            req["grid"] = [y0, y1, step]
-        else:
-            req["path"] = pts
-        self._svc(req)
         got = [0] * len(ys)
         windows = []     # per row: (still from, still until), print time
         # predicted next arrival, last used arrival, last move duration
@@ -2729,7 +2994,23 @@ class Lidar:
                     "G4 P%.0f" % ((a - lo + tail - t_arrive) * 1000.0,))
                 windows.append((still, toolhead.get_last_move_time()))
 
+        self.gcode.run_script_from_command(
+            "SAVE_GCODE_STATE NAME=_lidar_scan")
         try:
+            # setup inside the try: RESTORE_GCODE_STATE also when it fails
+            self.gcode.run_script_from_command(
+                "G90\nG0 Z%.3f F600\nG0 X%.3f Y%.3f F%.0f" % (
+                    z, pts[0][0] - xo, ys[0] - yo, self.speed * 60.0))
+            toolhead.wait_moves()
+            self._job_exposure()   # LiDAR over the plate at scan height now
+            req = {"cmd": "begin", "name": name, "x": x, "z": z,
+                   "x_dir": self.x_dir, "x_offset": xo, "y_offset": yo,
+                   "captures": 1, "level": level}
+            if path is None:
+                req["grid"] = [y0, y1, step]
+            else:
+                req["path"] = pts
+            self._svc(req)
             frame_msg = self._frame_msg()
             try:
                 self._send(frame_msg)
@@ -2754,8 +3035,10 @@ class Lidar:
                         break
                     while i < len(windows) - 1 and w1 > windows[i][1]:
                         i += 1
+                    # an error reply (no points) leaves the row to the
+                    # next frame
                     ok = (windows[i][0] <= w0 and w1 <= windows[i][1]
-                          and not got[i])
+                          and not got[i] and self._frame_ok(raw))
                     if debug is not None:
                         debug.append((round(arrival, 4), round(w0, 4),
                                       round(w1, 4), i, windows[i], ok,
@@ -2896,22 +3179,35 @@ class Lidar:
 
         frames = []
         frame_msg = self._frame_msg()
+        in_flight = False
         try:
             self._send(frame_msg)
+            in_flight = True
             while True:
                 raw, t = self._recv(5.0)
+                in_flight = False
                 pt = mcu.estimated_print_time(self._frame_time(raw, t))
                 # (not get_last_move_time() here: on an idle toolhead it
                 # keeps moving ahead, and this would never end)
                 last = bool(end) and pt > end[0] + 0.3
                 if not last:
                     self._send(frame_msg)
+                    in_flight = True
                 frames.append((pt, raw))
                 if last:
                     break
                 feed()
         except OSError as e:
+            in_flight = False
             raise self._driver_error(e)
+        finally:
+            if in_flight:
+                # (a move error in feed()) don't leave a reply in the
+                # socket for the next request
+                try:
+                    self._recv(5.0)
+                except OSError:
+                    self._close()
         toolhead.wait_moves()
         periods = [b[0] - a[0] for a, b in zip(frames, frames[1:])]
         lats = []
@@ -2945,8 +3241,11 @@ class Lidar:
         dz = gcmd.get_float("DZ", 1.5, above=0.3, maxval=2.0)
         speed = gcmd.get_float("SPEED", 5.0, above=0.2, maxval=10.0)
         cycles = gcmd.get_int("CYCLES", 15, minval=1, maxval=50)
-        levels = [int(v) for v in gcmd.get("LEVELS", "0,1").split(",")]
-        if any(v not in (0, 1, 2) for v in levels):
+        try:
+            levels = [int(v) for v in gcmd.get("LEVELS", "0,1").split(",")]
+        except ValueError:
+            levels = []
+        if not levels or any(v not in (0, 1, 2) for v in levels):
             raise gcmd.error("LIDAR_TIMING: LEVELS are 0, 1 or 2")
         driver = self._driver()
         self.gcode.run_script_from_command(
@@ -3231,6 +3530,8 @@ class Lidar:
             run(self.touch_wipe_gcode)
 
     def _grid(self, a, b, n):
+        if n <= 1:
+            return [round((a + b) / 2.0, 3)] if n == 1 else []
         return [round(a + (b - a) * i / (n - 1), 3) for i in range(n)]
 
     def _skewed(self, p):
@@ -3304,18 +3605,38 @@ class Lidar:
         return st.get("target") or st.get("temperature", 25.0)
 
     def _lidar_tables(self):
-        """(X twist, Y table, note) for the current bed temperature: from
-        the calibrations per temperature (lidar_cal_by_temp) when there are
-        any, else the last calibration (lidar_twist, lidar_ytwist)."""
+        """(X twist, Y table, note) for the current bed temperature and
+        plate (lidar_plate): from the calibrations per temperature
+        (lidar_cal_by_temp) when there are any, else the last calibration
+        (lidar_twist, lidar_ytwist; with a plate only if untagged or its
+        own)."""
         sv = self._saved()
+        plate = sv.get("lidar_plate")
         store = sv.get("lidar_cal_by_temp")
-        if store:
-            t = self._bed_temp_for_tables()
-            tw, yt, note = tables_for_temp(store, t)
-            tw = tw or sv.get("lidar_twist")
-            yt = yt or sv.get("lidar_ytwist")
-            return tw, yt, "bed %.0fC: %s" % (t, note)
-        return sv.get("lidar_twist"), sv.get("lidar_ytwist"), ""
+
+        def last(var):
+            v = sv.get(var)
+            return v if plate is None or plate_of(v) in (None, plate) \
+                else None
+        if not store and plate is None:
+            return sv.get("lidar_twist"), sv.get("lidar_ytwist"), ""
+        t = self._bed_temp_for_tables()
+        tw, yt, note = tables_for_temp(store, t, plate)
+        if plate is not None and not tw and not yt and not (
+                last("lidar_twist") or last("lidar_ytwist")):
+            return None, None, (
+                "plate %s, bed %.0fC: no LiDAR calibration for plate %s"
+                " (other plates' runs are not used): LIDAR_MESH_CALIBRATION"
+                " with this plate on" % (plate, t, plate))
+        if plate is None:
+            return (tw or sv.get("lidar_twist"), yt or sv.get("lidar_ytwist"),
+                    "bed %.0fC: %s" % (t, note))
+        for name, v in (("twist", tw), ("ytwist", yt)):
+            if not v and last("lidar_" + name):
+                note += "%s%s: the last calibration (lidar_%s)" % (
+                    ", " if note else "", name, name)
+        return (tw or last("lidar_twist"), yt or last("lidar_ytwist"),
+                "plate %s, bed %.0fC: %s" % (plate, t, note))
 
     def _store_by_temp(self, tables):
         """Keep tables {"twist": ..., "ytwist": ...} (either, with their
@@ -3325,13 +3646,75 @@ class Lidar:
         t = int(5 * round(self._bed_temp_for_tables() / 5.0))
         store = dict(self._saved().get("lidar_cal_by_temp") or {})
         runs = cal_runs(store.get(str(t)) or {"runs": []})
-        run = dict(tables, time=time.strftime("%Y-%m-%dT%H:%M"))
+        run = dict(tables, time=time.strftime("%Y-%m-%dT%H:%M"),
+                   plate=self._saved().get("lidar_plate"))
         runs = (runs + [run])[-CAL_RUNS:]
         store[str(t)] = {"runs": runs}
         self.gcode.run_script_from_command(
             'SAVE_VARIABLE VARIABLE=lidar_cal_by_temp VALUE="%s"' % (
                 repr(store).replace(" ", ""),))
         return t
+
+    desc_LIDAR_PLATE = ("The plate on the bed (NAME=black_pei): LiDAR mesh"
+                        " calibrations are kept and used per plate; no"
+                        " NAME: show the plates' calibration runs")
+
+    def cmd_LIDAR_PLATE(self, gcmd):
+        """NAME=: the plate now on the bed (lidar_plate); RESET_RUNS=1 drops
+        its calibration runs and the untagged ones (all of them when no plate
+        is set), keeping the other plates' (LIDAR_MESH_CALIBRATION RESET=1);
+        without either: the plates and their runs."""
+        run = self.gcode.run_script_from_command
+        name = gcmd.get("NAME", None)
+        sv = self._saved()
+        plate = sv.get("lidar_plate")
+        if name is not None:
+            if not PLATE_NAME.match(name):
+                raise gcmd.error("LIDAR_PLATE: NAME is 1-32 of a-z, 0-9 and"
+                                 " _ (e.g. black_pei)")
+            run('SAVE_VARIABLE VARIABLE=lidar_plate VALUE="%r"' % (name,))
+            plate = name
+            gcmd.respond_info("LiDAR plate: %s" % (name,))
+        if gcmd.get_int("RESET_RUNS", 0):
+            store = sv.get("lidar_cal_by_temp") or {}
+            left = drop_plate_runs(store, plate)
+            n = sum(len(cal_runs(e)) for e in store.values()) - sum(
+                len(e["runs"]) for e in left.values())
+            run('SAVE_VARIABLE VARIABLE=lidar_cal_by_temp VALUE="%s"' % (
+                repr(left).replace(" ", ""),))
+            gcmd.respond_info(
+                "LiDAR mesh calibration: %d earlier run%s cleared (%s)" % (
+                    n, "" if n == 1 else "s", "all plates" if plate is None
+                    else "plate %s and untagged; other plates kept" % (
+                        plate,)))
+        if name is None and not gcmd.get_int("RESET_RUNS", 0):
+            for line in self._plate_report(plate):
+                gcmd.respond_info(line)
+
+    def _plate_report(self, plate, runs=True):
+        """Console lines: the plate in use, the calibration runs per plate
+        (bed temperatures, count, newest; runs=False: only a warning when
+        the plate has none)."""
+        byp = plate_runs(self._saved().get("lidar_cal_by_temp"))
+        out = ["LiDAR plate: %s" % (
+            plate if plate is not None else "not set (LIDAR_PLATE NAME=...;"
+            " meshes use every calibration run)",)]
+        shown = sorted(byp, key=lambda k: (k is None, k or "")) if runs \
+            else []
+        for p in shown:
+            temps = byp[p]
+            times = [t for ts in temps.values() for t in ts]
+            out.append("  %s%s: %s, newest %s" % (
+                p if p is not None else "untagged",
+                " (in use)" if p == plate and p is not None else "",
+                ", ".join("%sC x%d" % (t, len(temps[t])) for t in sorted(
+                    temps, key=float)), max(times) or "?"))
+        if plate is not None and plate not in byp:
+            out.append("LiDAR plate %s: no calibration runs yet, run"
+                       " LIDAR_MESH_CALIBRATION with this plate on (meshes"
+                       " meanwhile use untagged tables only, never another"
+                       " plate's)" % (plate,))
+        return out
 
     def _temps(self):
         now = self.reactor.monotonic()
@@ -3391,15 +3774,25 @@ class Lidar:
              "twist": gcmd.get_int("TWIST", 1),
              "adaptive": gcmd.get_int("ADAPTIVE", 0),
              "fallback": gcmd.get_int("FALLBACK", 0)}
+        # lower bounds: a 0 here divides by zero deep inside the mesh
+        above = {"SPEED": 0.0, "STEP": 0.05, "HALF_Y": 0.0}
         for k in ("X0", "X1", "Y0", "Y1", "SPEED", "STEP", "HALF_Y",
                   "STRIP_X0", "STRIP_X1"):
             v = gcmd.get_float(k, None)
             if v is not None:
+                if k in above and not v > above[k]:
+                    raise gcmd.error("LiDAR: %s must be above %g" % (
+                        k, above[k]))
                 o[k.lower()] = v
+        minval = {"COUNT_X": 4, "COUNT_Y": 4, "FRAMES": 1, "STRIPS": 1,
+                  "TOUCHES": 2, "SAMPLES": 1}
         for k in ("COUNT_X", "COUNT_Y", "FRAMES", "STRIPS", "TOUCHES",
                   "WIPE", "BED_OFF", "BOTH_WAYS", "SAMPLES", "MAX_ORDER"):
             v = gcmd.get_int(k, None)
             if v is not None:
+                if v < minval.get(k, v):
+                    raise gcmd.error("LiDAR: %s must be at least %d" % (
+                        k, minval[k]))
                 o[k.lower()] = v
         if o["motion"] not in ("continuous", "dwell"):
             raise gcmd.error("LiDAR: MOTION is continuous or dwell")
@@ -3412,29 +3805,34 @@ class Lidar:
         ax0, ax1, y0, y1 = self._area_or_error(gcmd, o["z"])
         # strips (fine) look 14mm either side of their centre line
         x0, x1 = self._fine_x(o["z"]) if fine else (ax0, ax1)
-        fx0 = x0
         # strips (fine) reach 14mm past their centre line
         rx0, rx1 = self._reach_x(y0, y1, o["z"], 0.3)
         w = 14.0 if fine else 0.0
         x0, x1 = max(x0, rx0 - w), min(x1, rx1 + w)
-        if o.get("adaptive"):
+        lim = (x0, x1, y0, y1)     # what the LiDAR can see
+        pts = []
+        if o.get("adaptive") or o.get("fallback"):
             eo = self.printer.lookup_object("exclude_object", None)
             objs = eo.get_status(self.reactor.monotonic()).get(
                 "objects", []) if eo is not None else []
             pts = [p for ob in objs for p in (ob.get("polygon") or [])]
+        if pts:
+            # objects out of the LiDAR's reach: the probe (FALLBACK=1,
+            # also for a whole-bed mesh), else a warning
+            bx0, bx1 = min(p[0] for p in pts), max(p[0] for p in pts)
+            by0, by1 = min(p[1] for p in pts), max(p[1] for p in pts)
+            if bx0 < x0 - 1.0 or bx1 > x1 + 1.0 or by0 < y0 - 1.0 \
+                    or by1 > y1 + 1.0:
+                msg = ("the objects (X%.0f-%.0f Y%.0f-%.0f) reach past"
+                       " what the LiDAR sees (X%.0f-%.0f Y%.0f-%.0f)" % (
+                           bx0, bx1, by0, by1, x0, x1, y0, y1))
+                if o.get("fallback"):
+                    raise gcmd.error("LiDAR mesh: " + msg)
+                gcmd.respond_info("LiDAR mesh: %s, the mesh keeps its"
+                                  " edge values there" % (msg,))
+        if o.get("adaptive"):
             if pts:
                 m = 5.0
-                bx0, bx1 = min(p[0] for p in pts), max(p[0] for p in pts)
-                by0, by1 = min(p[1] for p in pts), max(p[1] for p in pts)
-                if bx0 < x0 - 1.0 or bx1 > x1 + 1.0 or by0 < y0 - 1.0 \
-                        or by1 > y1 + 1.0:
-                    msg = ("the objects (X%.0f-%.0f Y%.0f-%.0f) reach past"
-                           " what the LiDAR sees (X%.0f-%.0f Y%.0f-%.0f)" % (
-                               bx0, bx1, by0, by1, x0, x1, y0, y1))
-                    if o.get("fallback"):
-                        raise gcmd.error("LiDAR mesh: " + msg)
-                    gcmd.respond_info("LiDAR mesh: %s, the mesh keeps its"
-                                      " edge values there" % (msg,))
                 # the LiDAR has no absolute height: the mesh is made 0 at
                 # zero_reference_position (where Z is homed and touched),
                 # so that spot has to be in it
@@ -3450,12 +3848,22 @@ class Lidar:
                 gcmd.respond_info("LiDAR mesh: no objects defined, whole bed")
         x0, x1 = o.get("x0", x0), o.get("x1", x1)
         y0, y1 = o.get("y0", y0), o.get("y1", y1)
-        if x1 - x0 < 20.0 or y1 - y0 < 20.0:
-            # bicubic needs 4 points a side; keep at least 20mm
-            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            x0, x1 = max(cx - 10.0, fx0), \
-                max(cx + 10.0, x0 + 20.0)
-            y0, y1 = cy - 10.0, cy + 10.0
+
+        def widen(a, b, lo, hi, size=20.0):
+            # bicubic needs 4 points a side: keep at least 20mm, this axis
+            # only, inside what the LiDAR sees (it still holds a..b, so
+            # the objects and the zero reference stay in)
+            if b - a >= size:
+                return a, b
+            c = (a + b) / 2.0
+            a, b = c - size / 2.0, c + size / 2.0
+            if a < lo:
+                a, b = lo, lo + size
+            if b > hi:
+                a, b = max(lo, hi - size), hi
+            return a, b
+        x0, x1 = widen(x0, x1, lim[0], lim[1])
+        y0, y1 = widen(y0, y1, lim[2], lim[3])
         return x0, x1, y0, y1
 
     def _counts(self, o, n, x0, x1, y0, y1, full_x, full_y):
@@ -3536,7 +3944,8 @@ class Lidar:
                 (a, y, b, y) for a, b in zip(xs, xs[1:]) for y in (y0, y1)],
                 z)
             kept, dropped = self._scan_moving(
-                "mesh_fast", xs, y0, y1, z, speed, o.get("both_ways", 0))
+                "mesh_fast", xs, y0, y1, z, speed, o.get("both_ways", 0),
+                gcmd)
             res = self._svc({"cmd": "mesh_fast", "scan": "mesh_fast",
                              "xs": xs, "ys": ys, "half_x": o["half_x"],
                              "half_y": o.get("half_y", 1.5),
@@ -3705,7 +4114,16 @@ class Lidar:
             bm.set_mesh(old)
         return out
 
-    def _scan_moving(self, name, xs, y0, y1, z, speed, both_ways=0):
+    def _bed_restore(self, heater, target, on):
+        try:
+            now = heater.get_status(self.reactor.monotonic()).get("target")
+            if now != target:
+                self.gcode.run_script_from_command(on.strip())
+        except self.printer.command_error:
+            logging.exception("lidar: bed heater restore failed")
+
+    def _scan_moving(self, name, xs, y0, y1, z, speed, both_ways=0,
+                     gcmd=None):
         """Columns at laser X xs from y0 to y1 (serpentine; both_ways: each
         column there and back), at constant speed, frames streamed. Each
         frame covers a window before it arrives (LIDAR_TIMING, + moving_lag)
@@ -3721,7 +4139,11 @@ class Lidar:
         end of the speed-up, 0.4 mm into the column, at full speed). Frames
         therefore wait until the history covers their window (2026-10-29:
         without this the first half of every column was put at its start,
-        stripes alternating by column)."""
+        stripes alternating by column).
+
+        A column that got (almost) no frames (2026-11-17: a driver timeout
+        and module re-init during the first column) is scanned once more in
+        the same scan, its frames added to the few it has."""
         toolhead = self.printer.lookup_object("toolhead")
         mcu = self.printer.lookup_object("mcu")
         trapq = self.printer.lookup_object("motion_report").trapqs[
@@ -3732,25 +4154,23 @@ class Lidar:
         hold = period + (hi - lo) + 2 * self.dwell_margin + \
             self.dwell_settle + 0.05
         f, travel = speed * 60.0, max(speed, 150.0) * 60.0
+
+        def column(i):
+            """Start, end and moves of column i (from its start)."""
+            a, b = (y0, y1) if i % 2 == 0 else (y1, y0)
+            legs = [b, a] if both_ways else [b]
+            cmds = ["G4 P%.0f" % (hold * 1000.0,)]
+            for e in legs:
+                cmds += ["G0 Y%.3f F%.0f" % (e - yo, f),
+                         "G4 P%.0f" % (hold * 1000.0,)]
+            return a, legs[-1], cmds
         todo = []
         for i, x in enumerate(xs):
-            a, b = (y0, y1) if i % 2 == 0 else (y1, y0)
+            a, here, cmds = column(i)
             if i:
                 todo.append("G0 X%.3f Y%.3f F%.0f" % (x - xo, a - yo,
                                                       travel))
-            legs = [b, a] if both_ways else [b]
-            todo.append("G4 P%.0f" % (hold * 1000.0,))
-            for e in legs:
-                todo += ["G0 Y%.3f F%.0f" % (e - yo, f),
-                         "G4 P%.0f" % (hold * 1000.0,)]
-        self.gcode.run_script_from_command(
-            "SAVE_GCODE_STATE NAME=_lidar_scan\nG90\nG0 Z%.3f F600\n"
-            "G0 X%.3f Y%.3f F%.0f" % (z, xs[0] - xo, y0 - yo, travel))
-        toolhead.wait_moves()
-        self._job_exposure()
-        self._svc({"cmd": "begin", "name": name, "x": xs[0], "z": z,
-                   "x_dir": self.x_dir, "x_offset": xo, "y_offset": yo,
-                   "captures": 1, "level": self.scan_level, "path": []})
+            todo += cmds
         head = ('{"cmd": "frame", "name": %s, "x": %%.3f, "y": %%.3f,'
                 ' "span": %%.3f, "dir": %%d, "t": %%.4f, "raw": '
                 % (json.dumps(name),))
@@ -3758,6 +4178,7 @@ class Lidar:
         move_end = [0.0]   # print time the last queued G0 ends
         pending = []       # (arrival, raw): waiting for the trapq history
         count = [0, 0]     # kept, dropped
+        per_col = dict((x, 0) for x in xs)    # kept per column
 
         def feed(ahead=1.0):
             now = mcu.estimated_print_time(self.reactor.monotonic())
@@ -3773,7 +4194,8 @@ class Lidar:
             w0, w1 = arrival - hi + lag, arrival - lo + lag
             ps = [trapq.get_trapq_position(w) for w in
                   (w0, (w0 + w1) / 2, w1)]
-            ok = all(p is not None for p, v in ps)
+            # error replies (no points) are dropped too
+            ok = all(p is not None for p, v in ps) and self._frame_ok(raw)
             still = mv = False
             if ok:
                 ps = [(self._unskewed(p), v) for p, v in ps]
@@ -3797,6 +4219,7 @@ class Lidar:
                     col, ly, abs(p1[1] - p0[1]), d, arrival)).encode()
                     + raw.replace(b"\n", b" ") + b"}\n")
                 count[0] += 1
+                per_col[col] += 1
             else:
                 count[1] += 1
 
@@ -3808,42 +4231,79 @@ class Lidar:
                     pending[0][0] - lo + lag <= horizon)):
                 place(*pending.pop(0))
 
-        frame_msg = self._frame_msg()
-        in_flight = False
-        try:
-            try:
-                self._send(frame_msg)
-                in_flight = True
+        in_flight = [False]
+
+        def sweep():
+            # stream frames while the moves in todo run
+            self._send(frame_msg)
+            in_flight[0] = True
+            feed()
+            while True:
+                raw, t = self._recv(5.0)
+                in_flight[0] = False
+                arrival = mcu.estimated_print_time(
+                    self._frame_time(raw, t))
+                last = bool(end) and arrival - hi > end[0]
+                if not last:
+                    self._send(frame_msg)
+                    in_flight[0] = True
                 feed()
-                while True:
-                    raw, t = self._recv(5.0)
-                    in_flight = False
-                    arrival = mcu.estimated_print_time(
-                        self._frame_time(raw, t))
-                    last = bool(end) and arrival - hi > end[0]
-                    if not last:
-                        self._send(frame_msg)
-                        in_flight = True
-                    feed()
-                    pending.append((arrival, raw))
-                    flush()
-                    if last:
-                        break
-                toolhead.wait_moves()
-                # the last move reaches the history shortly after it ended;
-                # after it the toolhead stands still, so what is left can go
-                stop = self.reactor.monotonic() + 3.0
-                while pending and self.reactor.monotonic() < stop:
-                    h = self._trapq_horizon(trapq)
-                    if h is not None and h >= move_end[0] - 1e-6:
-                        break
-                    self.reactor.pause(self.reactor.monotonic() + 0.05)
-                flush(final=True)
+                pending.append((arrival, raw))
+                flush()
+                if last:
+                    break
+            toolhead.wait_moves()
+            # the last move reaches the history shortly after it ended;
+            # after it the toolhead stands still, so what is left can go
+            stop = self.reactor.monotonic() + 3.0
+            while pending and self.reactor.monotonic() < stop:
+                h = self._trapq_horizon(trapq)
+                if h is not None and h >= move_end[0] - 1e-6:
+                    break
+                self.reactor.pause(self.reactor.monotonic() + 0.05)
+            flush(final=True)
+
+        self.gcode.run_script_from_command(
+            "SAVE_GCODE_STATE NAME=_lidar_scan")
+        try:
+            # setup inside the try: RESTORE_GCODE_STATE also when it fails
+            self.gcode.run_script_from_command(
+                "G90\nG0 Z%.3f F600\nG0 X%.3f Y%.3f F%.0f" % (
+                    z, xs[0] - xo, y0 - yo, travel))
+            toolhead.wait_moves()
+            self._job_exposure()
+            self._svc({"cmd": "begin", "name": name, "x": xs[0], "z": z,
+                       "x_dir": self.x_dir, "x_offset": xo, "y_offset": yo,
+                       "captures": 1, "level": self.scan_level, "path": []})
+            frame_msg = self._frame_msg()
+            try:
+                sweep()
+                # columns with (almost) no frames: once more, from where the
+                # toolhead is along its end row (y0 or y1), then along the
+                # column to its start: only paths _check_reach passed
+                hx = xs[-1]
+                for x in poor_columns(xs, per_col):
+                    a, end_y, cmds = column(xs.index(x))
+                    if gcmd is not None:
+                        self._check_reach(gcmd, [(hx, here, x, here),
+                                                 (x, here, x, a)], z)
+                    n0 = per_col[x]
+                    todo[:] = ["G0 X%.3f Y%.3f F%.0f" % (
+                        x - xo, here - yo, travel), "G0 Y%.3f F%.0f" % (
+                        a - yo, travel)] + cmds
+                    del end[:]
+                    sweep()
+                    hx, here = x, end_y
+                    msg = "LiDAR mesh: rescanned X%.1f (%d frames)" % (
+                        x, per_col[x] - n0)
+                    if gcmd is not None:
+                        gcmd.respond_info(msg)
+                    logging.info("lidar: %s", msg)
             except OSError as e:
-                in_flight = False
+                in_flight[0] = False
                 raise self._driver_error(e)
         finally:
-            if in_flight:
+            if in_flight[0]:
                 try:
                     self._recv(5.0)
                 except OSError:
@@ -3963,12 +4423,41 @@ class Lidar:
         if nt or "5" in methods:
             self._touch_ready(gcmd)
         area = self._bench_area(gcmd, methods)
+        if nt == 1:
+            raise gcmd.error("MESH_BENCHMARK: TRUTH is 0 (no touches) or"
+                             " 2-10")
+        # every method checked before the first one runs
+        plans = []
+        for m in methods:
+            o = None
+            try:
+                if m == "probe":
+                    pass
+                elif m.startswith("cont"):
+                    o = {"level": 2, "speed": float(m[4:])}
+                    if not o["speed"] > 0:
+                        raise ValueError(m)
+                elif m.startswith("dwell"):
+                    o = {"level": int(m[5:]), "motion": "dwell"}
+                elif m.startswith("repeat"):
+                    o = {"level": int(m[6:])}
+                elif m in ("1", "2", "3", "4", "5"):
+                    o = {"level": int(m)}
+                else:
+                    raise ValueError(m)
+            except ValueError:
+                o = {"level": None}
+            if o is not None and o["level"] not in self.LEVELS:
+                raise gcmd.error("MESH_BENCHMARK: unknown method %s (probe,"
+                                 " 1-5, cont<speed>, dwell<level>,"
+                                 " repeat<level>)" % (m,))
+            plans.append((m, o))
         bm = self.printer.lookup_object("bed_mesh")
         atc = self.printer.lookup_object("axis_twist_compensation", None)
         run = self.gcode.run_script_from_command
         stamp = time.strftime("%Y%m%d-%H%M%S")
         done = []      # (name, profile, seconds, note, own touches)
-        for m in methods:
+        for m, mo in plans:
             t0 = self.reactor.monotonic()
             note, own = "", []
             if m == "probe":
@@ -3986,21 +4475,9 @@ class Lidar:
             else:
                 o = dict(area, z=self.scan_z, half_x=3.0, twist=1,
                          adaptive=0, motion="continuous")
-                if m.startswith("cont"):
-                    o.update(level=2, speed=float(m[4:]))
-                    prof = "bench_" + m
-                elif m.startswith("dwell"):
-                    o.update(level=int(m[5:]), motion="dwell")
-                    prof = "bench_" + m
-                elif m.startswith("repeat"):
-                    o.update(level=int(m[6:]))
-                    prof = "bench_" + m
-                elif m in ("1", "2", "3", "4", "5"):
-                    o.update(level=int(m))
-                    prof = "bench_L" + m
-                else:
-                    raise gcmd.error("MESH_BENCHMARK: unknown method %s" % (
-                        m,))
+                o.update(mo)
+                prof = "bench_L" + m if m in ("1", "2", "3", "4", "5") \
+                    else "bench_" + m
                 o["profile"] = prof
                 res = self._mesh(gcmd, o)
                 if o["level"] == 5 and res.get("correction"):
@@ -4189,6 +4666,10 @@ class Lidar:
                                       " %.4f" % (x, y, nz, h))
             run("G0 Z5 F900")
         finally:
+            if on:
+                # a failed touch skips the rest of its script, the "on"
+                # line included: the bed back at its target
+                self._bed_restore(heater, target, on)
             bm.set_mesh(old_mesh)
         vals, drift, spread = drift_fit_spots(diffs)
         means = [vals[sp] for sp in spots]
@@ -4322,6 +4803,10 @@ class Lidar:
                     dists.append(-h - (z + z_off - nz))
             run("G0 Z5 F900")
         finally:
+            if on:
+                # a failed touch skips the rest of its script, the "on"
+                # line included: the bed back at its target
+                self._bed_restore(heater, target, on)
             bm.set_mesh(old_mesh)
         d, drift, spread = drift_fit_spots(diffs)
         try:
@@ -4385,8 +4870,9 @@ class Lidar:
         # weights in the average of runs: the rows (X curve) and columns
         # (Y curve) each point of a curve averages
         tables[0][1]["w"], tables[1][1]["w"] = ny, nx
+        plate = self._saved().get("lidar_plate")
         for var, val in tables:
-            val["bed"] = bed
+            val["bed"], val["plate"] = bed, plate
             run('SAVE_VARIABLE VARIABLE=%s VALUE="%s"' % (
                 var, repr(val).replace(" ", "")))
         t = self._store_by_temp({"twist": tables[0][1],
@@ -4456,6 +4942,7 @@ class Lidar:
         if not apply:
             return
         twist["bed"] = bed
+        twist["plate"] = self._saved().get("lidar_plate")
         # weight in the average of runs: the lines it came from
         twist["w"] = len(y) if isinstance(y, list) else 1
         for v, val in ((var, twist), ("lidar_zero_log", log)):
@@ -4528,7 +5015,7 @@ class Lidar:
         st = toolhead.get_status(self.reactor.monotonic())
         if "xyz" not in st["homed_axes"]:
             raise gcmd.error("FIRST_LAYER_SCAN: home first")
-        xo, yo = self._xo(z), self._yo(z)
+        yo = self._yo(z)
         ly0 = st["axis_minimum"][1] + yo + 0.5
         ay1 = self._laser_area(z)[3]
         rx0, rx1 = self._reach_x(ly0, ay1, z)
@@ -4565,9 +5052,16 @@ class Lidar:
                        file=ps.get_status(self.reactor.monotonic()).get(
                            "filename") if ps is not None else "",
                        armed=False)
-        self._svc({"cmd": "fl_begin", "fl": self.fl["id"]})
         t0 = self.reactor.monotonic()
-        self._fl_scans(gcmd, "before")
+        try:
+            self._svc({"cmd": "fl_begin", "fl": self.fl["id"]})
+            self._fl_scans(gcmd, "before")
+        except self.printer.command_error as e:
+            # the helper or the driver not answering: the print goes on, only
+            # the (optional) check is lost
+            self.fl = None
+            gcmd.respond_info("First-layer check: skipped (%s)" % (e,))
+            return
         self.fl["armed"] = True
         self.fl["temps_before"] = self._temps()
         gcmd.respond_info(
@@ -4580,37 +5074,44 @@ class Lidar:
 
     FL_PRIME_RETRACT = 0.5   # mm, after the prime line (like the line purge)
 
-    def _fl_prime(self, fl, e):
-        """Prime line after the first-layer scan: e mm of filament along a
-        25 mm line 8 mm in front of the objects (between them and the line
-        purge, 15 mm in front), 0.5 mm high like the purge, then a short
-        retract and a sideways flick for the string. Called lifted, hot.
-        False (nothing done) if there is no room in front."""
-        pts = [p for o in fl.get("objects") or [] for p in o["polygon"]]
-        if not pts:
-            return False
-        y = min(p[1] for p in pts) - 8.0
-        cx = (min(p[0] for p in pts) + max(p[0] for p in pts)) / 2.0
-        a, b = cx - 12.5, cx + 12.5
-        if y < 5.0:
-            return False
+    def _fl_prime(self, fl, retract, tip, purge):
+        """Prime after the first-layer scan, like the start purge: the
+        nozzle oozed for minutes, so first refill it (retract + tip mm in
+        place), then a purge line of `purge` mm (fl_prime_plan: in front of
+        the objects, else beside or behind them), a short retract and a
+        flick for the string. Height and speed from _KAMP_Settings. Called
+        lifted, hot. The plan, or None (nothing done: no room)."""
+        kamp = self.printer.lookup_object("gcode_macro _KAMP_Settings", None)
+        kv = getattr(kamp, "variables", None) or {}
+        height = float(kv.get("purge_height", 0.5))
+        flow = float(kv.get("flow_rate", 12.0))
 
         class _G:
             error = self.printer.command_error
-        try:
-            self._check_reach(_G(), [(a, y, b + 5.0, y)])
-        except self.printer.command_error:
-            return False
+
+        def fits(segs):
+            try:
+                self._check_reach(_G(), segs)
+                return True
+            except self.printer.command_error:
+                return False
+        p = fl_prime_plan(fl.get("objects"), tip, purge, height, flow, fits)
+        if p is None:
+            return None
         gm = self.printer.lookup_object("gcode_move")
         lift = gm.get_status(self.reactor.monotonic())["gcode_position"][2]
         run = self.gcode.run_script_from_command
-        run("G90\nG0 X%.3f Y%.3f F%.0f\nG0 Z0.5 F600" % (
-            a, y, self.speed * 60.0))
-        # 10 mm/s: ~0.4 mm2 of line at 0.5 mm, ~4 mm3/s
-        run("M83\nG1 X%.3f E%.3f F600" % (b, e))
-        run("G1 E-%.2f F2100\nG0 X%.3f F6000\nG90\nG0 Z%.3f F600" % (
-            self.FL_PRIME_RETRACT, b + 5.0, max(lift, 1.0)))
-        return True
+        run("G90\nG0 X%.3f Y%.3f F%.0f\nG0 Z%.3f F600" % (
+            p["x0"], p["y0"], self.speed * 60.0, p["z"]))
+        run("M83")
+        if retract + tip > 0:
+            run("G1 E%.2f F%.0f" % (retract + tip, p["feed"]))
+        if purge > 0:
+            run("G1 X%.3f Y%.3f E%.3f F%.0f" % (p["x1"], p["y1"], purge,
+                                                p["feed"]))
+        run("G1 E-%.2f F2100\nG0 X%.3f Y%.3f F6000\nG90\nG0 Z%.3f F600" % (
+            self.FL_PRIME_RETRACT, p["fx"], p["fy"], max(lift, 1.0)))
+        return p
 
     def _fl_after(self, gcmd):
         fl = self.fl
@@ -4620,7 +5121,10 @@ class Lidar:
         ps = self.printer.lookup_object("print_stats", None)
         state = ps.get_status(self.reactor.monotonic())["state"] \
             if ps is not None else "printing"
-        if state != "printing" and not final:
+        # FINAL (END_PRINT): only at the end of a real print, not after
+        # START_PRINT/END_PRINT run by a calibration command
+        if (state != "printing" and not final) or \
+                state not in ("printing", "paused"):
             gcmd.respond_info("First-layer check: print is %s, skipped"
                               % (state,))
             self.fl = None
@@ -4628,9 +5132,11 @@ class Lidar:
         fl["armed"] = False
         retract = gcmd.get_float("RETRACT", 1.0, minval=0.0, maxval=3.0)
         cool = gcmd.get_float("COOL", 30.0, minval=0.0, maxval=80.0)
-        # mm of filament on top of the retract to refill the nozzle after
-        # the pause (it oozes while it waits), as a line off the part
-        prime = gcmd.get_float("PRIME", 3.0, minval=0.0, maxval=15.0)
+        # the nozzle oozes for minutes while it waits: refill the tip (TIP mm
+        # on top of the retract), then purge PRIME mm as a line off the part
+        # (3 mm only refilled it: nothing reached the plate, 2026-11-17)
+        tip = gcmd.get_float("TIP", 5.0, minval=0.0, maxval=20.0)
+        prime = gcmd.get_float("PRIME", 20.0, minval=0.0, maxval=60.0)
         run = self.gcode.run_script_from_command
         heater = self.printer.lookup_object("toolhead").get_extruder() \
             .get_heater()
@@ -4639,8 +5145,26 @@ class Lidar:
         pos = gm.get_status(self.reactor.monotonic())["gcode_position"]
         t0 = self.reactor.monotonic()
         res = None
+        # the slicer's first-layer limits are still active here (accel 3000
+        # on the K1 Max profiles): the scan's row moves then took 37 instead
+        # of 22 s per strip. Scan at START_PRINT's limits (like the bare-plate
+        # scan), give the print its own back afterwards
+        th = self.printer.lookup_object("toolhead")
+        st = th.get_status(self.reactor.monotonic())
+        was = [st.get(k) for k in ("max_velocity", "max_accel",
+                                   "square_corner_velocity")]
+        sp = self.printer.lookup_object("gcode_macro _START_END_PARAMS", None)
+        sv = getattr(sp, "variables", None) or {}
+        fast = None
+        if None not in was:
+            fast = (max(was[0], float(sv.get("start_max_velocity", 400.0))),
+                    max(was[1], float(sv.get("start_max_accel", 10000.0))))
+            if fast == tuple(was[:2]):
+                fast = None
         run("SAVE_GCODE_STATE NAME=_fl_after")
         try:
+            if fast:
+                run("SET_VELOCITY_LIMIT VELOCITY=%.0f ACCEL=%.0f" % fast)
             # no ooze onto the layer while the LiDAR looks at it: retract,
             # and let the nozzle cool a little (heated back before printing)
             if retract:
@@ -4655,16 +5179,29 @@ class Lidar:
             # the print goes on; only the check is lost
             gcmd.respond_info("First-layer check failed: %s" % (e,))
         finally:
+            if fast:
+                run("SET_VELOCITY_LIMIT VELOCITY=%.0f ACCEL=%.0f"
+                    " SQUARE_CORNER_VELOCITY=%g" % tuple(was))
             if not final:
                 # back over where the print stopped, still lifted, hot
                 # again, then down and unretracted
                 if cool and target > 0:
                     run("M109 S%.0f" % (target,))
                 back = retract
-                if prime and self._fl_prime(fl, retract + prime):
-                    # the prime line refilled it and left this much
-                    # retracted for the travel back
+                p = self._fl_prime(fl, retract, tip, prime) \
+                    if tip or prime else None
+                if p is not None:
+                    # the purge refilled it and left this much retracted
+                    # for the travel back
                     back = self.FL_PRIME_RETRACT
+                    gcmd.respond_info(
+                        "First-layer check: primed %.0f+%.0f mm (%s of the"
+                        " objects, X%.0f-%.0f Y%.0f-%.0f)" % (
+                            tip, prime, p["side"], p["x0"], p["x1"],
+                            p["y0"], p["y1"]))
+                elif tip or prime:
+                    gcmd.respond_info("First-layer check: prime skipped (no"
+                                      " room around the objects)")
                 run("G90\nG0 X%.3f Y%.3f F%.0f" % (pos[0], pos[1],
                                                      self.speed * 60.0))
                 run("RESTORE_GCODE_STATE NAME=_fl_after MOVE=1"
@@ -4695,6 +5232,11 @@ class Lidar:
                 "step": fl["step"], "x_dir": self.x_dir,
                 "z_before": fl["z_before"], "z_after": fl["z_after"],
                 "height": fl["height"], "objects": fl["objects"]}
+        # parts too narrow to fit the line ramp use this filament's last ones
+        key = self._fl_key(fl)
+        ramp = self._fl_ramp_for(key)
+        if ramp is not None:
+            plan["line_ramp"] = ramp
         try:
             res = self._svc({"cmd": "fl_analyze", "fl": fl["id"],
                              "plan": plan, "meta": meta},
@@ -4703,18 +5245,21 @@ class Lidar:
             gcmd.respond_info("First-layer check: analysis failed (%s)"
                               % (e,))
             return None
+        self._fl_ramp_store(key, res)
         if not res.get("ok"):
             gcmd.respond_info("First-layer check: no result (%s)"
                               % (res.get("reason"),))
             return res
         h = fl["height"]
+        tl = res.get("tilt_um_per_100mm")
         gcmd.respond_info(
             "First-layer check: %.3fmm measured for %.3fmm sliced (%+.3f),"
-            " p05-p95 %.3f-%.3f over %.0f mm2; tilt X %+.0f Y %+.0f"
-            " um/100mm; plate drift between the scans %+.0f um%s" % (
+            " p05-p95 %.3f-%.3f over %.0f mm2; %s; plate drift between the"
+            " scans %+.0f um%s" % (
                 res["median"], h, res["error"], res["p05"], res["p95"],
-                res["area_mm2"], res["tilt_um_per_100mm"][0],
-                res["tilt_um_per_100mm"][1], res["drift"]["plane"][0] * 1000,
+                res["area_mm2"], "tilt X %+.0f Y %+.0f um/100mm" % tuple(tl)
+                if tl else "no tilt (cells in one row)",
+                res["drift"]["plane"][0] * 1000,
                 ", curved by %.0f um (taken off)" % (
                     res["drift"]["bowl"] * 1000)
                 if res["drift"].get("surface") == "quadratic" else ""))
@@ -4725,6 +5270,29 @@ class Lidar:
         if res.get("html"):
             gcmd.respond_info("  report: %s on the helper" % (res["html"],))
         return res
+
+    # the laser line's slope along itself on plastic (fl_analyze's line ramp,
+    # um/mm, PLA ~ -0.9): the last FL_RAMP_KEEP fits per filament; their
+    # median is used where a part is too narrow to fit it (< 40 mm in X)
+    FL_RAMP_KEEP, FL_RAMP_MAX = 5, 5.0
+
+    def _fl_ramp_for(self, key):
+        """This filament's line ramp (mm per mm) or None."""
+        vals = (self._saved().get("fl_line_ramp") or {}).get(key) or []
+        return median(vals) / 1000.0 if vals else None
+
+    def _fl_ramp_store(self, key, res):
+        """Keep a fitted (not the plan's), plausible line ramp."""
+        r = res.get("line_ramp")
+        if not (res.get("ok") and res.get("line_ramp_fitted")) or r is None \
+                or abs(r) > self.FL_RAMP_MAX:
+            return
+        saved = dict(self._saved().get("fl_line_ramp") or {})
+        saved[key] = (list(saved.get(key) or []) + [round(r, 2)])[
+            -self.FL_RAMP_KEEP:]
+        self.gcode.run_script_from_command(
+            'SAVE_VARIABLE VARIABLE=fl_line_ramp VALUE="%s"' % (
+                repr(saved).replace(" ", ""),))
 
     # learning: half the error per print, at most FL_STEP per print and
     # FL_MAX in total (mm), only from a clean measurement
@@ -4793,7 +5361,7 @@ class Lidar:
         # does the plate; Z homed on top of the part only adds its height
         height = gcmd.get_float("HEIGHT", 1.0, minval=0.2, maxval=3.0)
         z = gcmd.get_float("Z", self.scan_z + height, minval=self.scan_z)
-        xo, yo = self._xo(z), self._yo(z)
+        yo = self._yo(z)
         ly0 = st["axis_minimum"][1] + yo + 0.5
         ay1 = self._laser_area(z)[3]
         rx0, rx1 = self._reach_x(ly0, ay1, z)
@@ -4953,29 +5521,30 @@ class Lidar:
 
     # ------------------------------------------------------- PA test print
     # --------------------------------------- PA + flow calibration print
-    # One print measures both (docs/camera.md): 9 PA lines and 4 triplets of
-    # 90/100/110 % flow lines, photographed by the LiDAR's camera (line
-    # WIDTH: the LiDAR misreads thin translucent lines, the laser light
-    # spreads inside them), the gap under the triplets from bare LiDAR
-    # strips. The helper plans the print (pf_plan), takes and analyses the
-    # photos (photo, pf_analyze); this plugin checks the paths, moves, scans
-    # and saves the results. PA is saved; the flow is EXPERIMENTAL (it read
-    # ~4 % low against a printed check on the K1 Max) and only saved with
-    # FLOW_SAVE=1. Without the helper or the camera (`camera: False`)
-    # LIDAR_PA_CALIBRATE prints the LiDAR-only PA test instead.
-    desc_LIDAR_PA_FLOW_CALIBRATE = ("Print PA and flow lines, measure them"
-                                    " with the LiDAR camera, save PA (and"
-                                    " the filament's flow with FLOW_SAVE=1,"
-                                    " experimental)")
+    # One print for PA and/or flow (docs/camera.md; flow bands since 0.5.0):
+    # 9 PA lines photographed by the LiDAR's camera (line WIDTH: the LiDAR
+    # misreads thin translucent lines) and 6 one-layer bands at 92..112 %
+    # judged by the camera (IR), the LiDAR (bare + printed strips) or both
+    # (benchmark: the user picks with LIDAR_PA_SAVE / LIDAR_FLOW_SAVE). The
+    # helper plans the print (pf_plan), takes and analyses the photos
+    # (photo, pf_analyze); this plugin checks the paths, moves, scans and
+    # saves the results. The flow is EXPERIMENTAL (the camera read ~4 % low
+    # against a printed check on the K1 Max): FLOW_METHOD defaults to BOTH,
+    # nothing saved until LIDAR_FLOW_SAVE. Without the helper (or in local
+    # mode) LIDAR_PA_CALIBRATE prints the LiDAR-only PA test instead.
+    desc_LIDAR_PA_FLOW_CALIBRATE = ("Print PA lines and/or flow bands"
+                                    " (TESTS=PA,FLOW FLOW_METHOD=IR|LIDAR|"
+                                    "BOTH), measure them, save the results")
     desc_LIDAR_PA_CALIBRATE = ("Print and measure a pressure advance test"
-                               " (camera with the helper, else the LiDAR)")
+                               " (camera/LiDAR strips with the helper, else"
+                               " the LiDAR-only test)")
     desc_LIDAR_PA_FLOW_STEP = ("Internal step of the PA/flow calibration"
                                " print (BARE, PHOTOS, ANALYZE)")
+    desc_LIDAR_FLOW_SAVE = ("Save the flow of the last LiDAR benchmark"
+                            " (METHOD=IR camera, METHOD=LIDAR)")
+    desc_LIDAR_PA_SAVE = ("Save the PA of the last LiDAR benchmark"
+                          " (METHOD=IR camera, METHOD=LIDAR)")
     PF_FILE = "lidar_pa_flow_test.gcode"
-    # the PA/flow print's plate area around X=/Y= (nozzle, see
-    # helper/lidar_pa_flow.py): X-14..X+24, Y-2..Y+187
-    PF_EXTENT = (-14.0, 24.0, -2.0, 187.0)
-
     # -------------------------------------------- where test prints go
     # The defaults are the K1 Max's; where they don't fit, the print is
     # centred in the laser area. X=/Y= must fit, else nothing is started.
@@ -5050,14 +5619,23 @@ class Lidar:
         cam = self.camera
         if cam is None:           # objects built without __init__ (tests)
             cam = getattr(self, "x_dir", -1.0) < 0
-        return bool(self.service) and cam
+        return bool(self.service) and not self.svc_local and cam
 
     def cmd_LIDAR_PA_CALIBRATE(self, gcmd):
-        if self._camera_ok():
-            return self.cmd_LIDAR_PA_FLOW_CALIBRATE(gcmd)
-        return self._pa_lidar_print(gcmd)
+        """With the helper (not local): the PA lines of the PA/flow print,
+        METHOD=IR (camera, the default when it is on), LIDAR (strips) or
+        BOTH (benchmark); else the LiDAR-only PA test print."""
+        if not self.service or self.svc_local:
+            return self._pa_lidar_print(gcmd)
+        return self._pf_calibrate(gcmd, tests="PA", pa_method=gcmd.get(
+            "METHOD", "IR" if self._camera_ok() else "LIDAR"))
+
+    PF_METHODS = {"IR": "ir", "LIDAR": "lidar", "BOTH": "both"}
 
     def cmd_LIDAR_PA_FLOW_CALIBRATE(self, gcmd):
+        return self._pf_calibrate(gcmd)
+
+    def _pf_calibrate(self, gcmd, tests=None, pa_method=None):
         state = self.printer.lookup_object("print_stats").get_status(
             self.reactor.monotonic())["state"]
         if state in ("printing", "paused"):
@@ -5065,29 +5643,57 @@ class Lidar:
         if not self.service:
             raise gcmd.error("LiDAR: the PA/flow calibration needs the helper"
                              " service ([lidar] service:)")
-        if not self._camera_ok():
+        if self.svc_local:
+            # photos and bands are analysed with numpy/PIL, which the
+            # printer may not have: refuse before anything is printed
+            raise gcmd.error("LiDAR: the PA/flow calibration needs the helper"
+                             " on another machine (numpy/PIL); the service on"
+                             " this printer (local mode) can't run it;"
+                             " LIDAR_PA_CALIBRATE prints the LiDAR-only PA"
+                             " test instead")
+        tests = [t.strip().lower() for t in (tests or gcmd.get(
+            "TESTS", "PA,FLOW")).split(",") if t.strip()]
+        if not tests or [t for t in tests if t not in ("pa", "flow")]:
+            raise gcmd.error("LiDAR: TESTS=PA, FLOW or PA,FLOW")
+        method = self.PF_METHODS.get(gcmd.get("FLOW_METHOD", "BOTH").upper())
+        pa_method = self.PF_METHODS.get((pa_method or gcmd.get(
+            "PA_METHOD", "IR")).upper())
+        if method is None or pa_method is None:
+            raise gcmd.error("LiDAR: PA_METHOD / FLOW_METHOD = IR, LIDAR or"
+                             " BOTH")
+        uses_ir = ("pa" in tests and pa_method != "lidar") or (
+            "flow" in tests and method != "lidar")
+        if uses_ir and not self._camera_ok():
             raise gcmd.error("LiDAR: the camera calibrations are off"
                              " ([lidar] camera: False, or x_dir is not -1);"
-                             " LIDAR_PA_CALIBRATE uses the LiDAR instead")
+                             " use PA_METHOD=LIDAR / FLOW_METHOD=LIDAR")
+        try:
+            flows = [float(v) for v in gcmd.get(
+                "FLOWS", "0.92,0.96,1.00,1.04,1.08,1.12").split(",")]
+        except ValueError:
+            flows = []
+        if len(flows) < 3 or not all(0.5 < f < 1.5 for f in flows) or \
+                flows != sorted(flows):
+            raise gcmd.error("LiDAR: FLOWS= at least 3 rising factors, e.g."
+                             " 0.92,0.96,1.00 (not percent)")
         toolhead = self.printer.lookup_object("toolhead")
         ext = toolhead.get_extruder()
         name = gcmd.get("FILAMENT_NAME", "").strip() or str(
             self._saved().get("last_filament_name", "") or "")
         params = {
+            "tests": tests, "flow_method": method, "pa_method": pa_method,
+            "flows": flows,
             "extruder_temp": gcmd.get_float("EXTRUDER_TEMP", above=150.0),
             "bed_temp": gcmd.get_float("BED_TEMP", 60.0, minval=0.0),
             "filament_name": name,
             "filament_type": gcmd.get("FILAMENT_TYPE", "").strip(),
             "pa_start": gcmd.get_float("PA_START", 0.0, minval=0.0),
             "pa_step": gcmd.get_float("PA_STEP", 0.01, above=0.0),
-            "flows": [float(v) for v in gcmd.get(
-                "FLOWS", "0.90,1.00,1.10").split(",")],
             "speed": gcmd.get_float("SPEED", 40.0, above=5.0),
             "pa_keep": ext.get_status(self.reactor.monotonic()).get(
                 "pressure_advance", 0.0),
             "fil_area": getattr(ext, "filament_area", 2.405),
             "max_accel": toolhead.max_accel}
-        flow_save = gcmd.get_int("FLOW_SAVE", 0, minval=0, maxval=1)
         plans = {}
 
         def plan_at(x, y):
@@ -5111,12 +5717,10 @@ class Lidar:
         centred = tuple(round(d + (lo[i] + hi[i]) / 2.0 - (
             min(p[i] for p in pts) + max(p[i] for p in pts)) / 2.0, 1)
             for i, d in ((0, 100.0), (1, 35.0)))
-        e = self.PF_EXTENT
         x, y = self._place(gcmd, (100.0, 35.0), centred, checks)
         params.update(x=x, y=y)
         plan = plan_at(x, y)
-        test = dict(plan["test"], job=time.strftime("%Y%m%d-%H%M%S"),
-                    flow_save=flow_save)
+        test = dict(plan["test"], job=time.strftime("%Y%m%d-%H%M%S"))
         if not os.path.isdir(self.data_dir):
             os.makedirs(self.data_dir)
         with open(os.path.join(self.data_dir, "pa_flow_test.json"), "w") as f:
@@ -5124,15 +5728,22 @@ class Lidar:
         with open(os.path.join(self.gcode_dir, self.PF_FILE), "w") as f:
             f.write("\n".join(plan["gcode"]) + "\n")
         self.pf = test
-        gcmd.respond_info(
-            "LiDAR PA + flow calibration for %s: PA %.3f-%.3f, flows %s%s,"
-            " plate X%.0f-%.0f Y%.0f-%.0f; starting %s" % (
+        what = []
+        names = {"ir": "camera", "lidar": "LiDAR",
+                 "both": "benchmark: camera and LiDAR"}
+        if "pa" in test:
+            what.append("PA %.3f-%.3f (%s)" % (
+                test["pa"]["pa"][0], test["pa"]["pa"][-1], names[pa_method]))
+        if "flow" in test:
+            what.append("flow bands %s (%s)" % (
+                "/".join("%.0f" % (f * 100) for f in flows), names[method]))
+        a = test["area"]
+        self.gcode.respond_info(
+            "LiDAR calibration for %s at %.0f/%.0f C: %s; keep the plate clear"
+            " X%.0f-%.0f Y%.0f-%.0f; starting %s" % (
                 name or params["filament_type"] or "unknown",
-                test["pa"]["pa"][0], test["pa"]["pa"][-1],
-                "/".join("%.0f" % (f * 100) for f in params["flows"]),
-                "" if flow_save else " (flow measured, not saved:"
-                " FLOW_SAVE=1 saves it)",
-                x + e[0], x + e[1], y + e[2], y + e[3], self.PF_FILE))
+                params["extruder_temp"], params["bed_temp"], ", ".join(what),
+                a[0], a[2], a[1], a[3], self.PF_FILE))
         self.gcode.run_script_from_command(
             "SDCARD_PRINT_FILE FILENAME=%s" % (self.PF_FILE,))
 
@@ -5273,6 +5884,11 @@ class Lidar:
                           "x": x, "y": y, "z": 3.0, "exposure": exposure,
                           "light": 1, "laser": 0}, timeout=60.0)
 
+    def _pf_strips(self, t, suffix=""):
+        for s in t.get("strips") or []:
+            self._scan_dwell(s["name"] + suffix, s["x"], s["y0"], s["y1"],
+                             0.4, 3.0)
+
     def cmd_LIDAR_PA_FLOW_STEP(self, gcmd):
         t = self._pf_job(gcmd)
         step = gcmd.get("STEP", "").upper()
@@ -5288,36 +5904,32 @@ class Lidar:
             ph = self._pf_photo(t, "plate", pp["x"], pp["y"], 1000)
             med = ph.get("median") or 0.0    # None: brightness unreadable
             t["photo_exposure"] = 2000 if med < 20 else 1000
-            t["lidar_pa"] = med > 60       # bright plate: keep the LiDAR way
+            # LiDAR PA strips: asked for, or a bright plate (the camera's
+            # fallback)
+            t["lidar_pa"] = "pa" in t and (
+                t["pa"].get("method", "ir") != "ir" or med > 60)
             if t["lidar_pa"]:
                 s = t["pa_strip"]
                 self._scan_dwell("pf_pa_base", s["x"], s["y0"], s["y1"], 0.4,
                                  3.0)
-            bm = self.printer.lookup_object("bed_mesh", None)
-            mesh = bm.get_mesh() if bm is not None else None
-            t["mesh"] = {}
-            for s in t["strips"]:
-                self._scan_dwell(s["name"], s["x"], s["y0"], s["y1"], 0.4,
-                                 3.0)
-                ys, y = [], s["y0"]
-                while y <= s["y1"] + 1e-6:
-                    ys.append(round(y, 3))
-                    y += 1.0
-                t["mesh"][s["name"]] = [
-                    [yy, round(mesh.calc_z(s["x"], yy), 5) if mesh else 0.0]
-                    for yy in ys]
+            self._pf_strips(t)
             self.gcode.respond_info(
-                "LiDAR PA/flow: exposure %d (%s), plate %.0f -> photos at %d%s"
-                % (t["exposure"], ae.get("x_range"), med, t["photo_exposure"],
-                   ", LiDAR PA strip too" if t["lidar_pa"] else ""))
+                "LiDAR calibration: exposure %d (%s), plate %.0f -> photos at"
+                " %d%s%s" % (t["exposure"], ae.get("x_range"), med,
+                             t["photo_exposure"],
+                             ", LiDAR PA strip too" if t["lidar_pa"] else "",
+                             ", %d bare band strips" % len(t["strips"])
+                             if t.get("strips") else ""))
         elif step == "PHOTOS":
             e = t.get("photo_exposure", 2000)
             for ph in t["photos"]:
-                self._pf_photo(t, ph["name"], ph["x"], ph["y"], e)
+                self._pf_photo(t, ph["name"], ph["x"], ph["y"],
+                               ph.get("exposure") or e)
             if t.get("lidar_pa"):
                 s = t["pa_strip"]
                 self._scan_dwell("pf_pa_scan", s["x"], s["y0"], s["y1"], 0.4,
                                  3.0)
+            self._pf_strips(t, "_after")
         elif step == "ANALYZE":
             try:
                 self._pf_analyze(t)
@@ -5326,55 +5938,199 @@ class Lidar:
         else:
             raise gcmd.error("LIDAR_PA_FLOW_STEP: STEP=BARE|PHOTOS|ANALYZE")
 
+    @staticmethod
+    def _pf_key(t):
+        name = t.get("filament_name") or t.get("filament_type") or "unknown"
+        return name.replace(" ", "_").replace('"', "").replace("'", "")
+
+    def _pf_save_flow(self, key, fl, src):
+        sv = self._saved()
+        z = float((sv.get("fl_zoffset") or {}).get(key, 0.0))
+        saved = dict(sv.get("lidar_flow") or {})
+        saved[key] = {"f": fl["f"], "dfdh": 0.0, "z": round(z, 4),
+                      "t": time.strftime("%Y-%m-%d"), "src": src}
+        self.gcode.run_script_from_command(
+            'SAVE_VARIABLE VARIABLE=lidar_flow VALUE="%s"'
+            % (repr(saved).replace(" ", ""),))
+        self.gcode.respond_info(
+            "LiDAR flow for %s (%s): %.0f %% -> M221 S%.1f at print start"
+            " (keep the slicer's flow ratio at 1.0)" % (
+                key, {"ir": "camera", "lidar": "LiDAR"}[src],
+                fl["flow"] * 100, 100.0 / fl["f"]))
+
     def _pf_analyze(self, t):
         say = self.gcode.respond_info
-        tw, ytw = self._lidar_tables()[:2]
         try:
-            r = self._svc({"cmd": "pf_analyze", "job": t["job"], "test": t,
-                           "mesh": t.get("mesh", {}),
-                           "tables": {"twist": tw, "ytwist": ytw}},
+            r = self._svc({"cmd": "pf_analyze", "job": t["job"], "test": t},
                           timeout=240.0)
         except self.printer.command_error as e:
-            say("LiDAR PA/flow analysis failed, nothing saved: %s" % (e,))
+            say("LiDAR calibration analysis failed, nothing saved: %s" % (e,))
             return
-        pa, fl = r.get("pa", {}), r.get("flow", {})
-        for line in (pa.get("report") or []) + (fl.get("report") or []):
+        pa, pas, flows = r.get("pa"), r.get("pas") or {}, r.get("flows") or {}
+        for line in [l for m in sorted(pas) for l in pas[m].get("report")
+                     or []] + [l for m in sorted(flows)
+                               for l in flows[m].get("report") or []]:
             say(line)
-        if pa.get("ok"):
-            self.gcode.run_script_from_command(
-                "SET_PRESSURE_ADVANCE ADVANCE=%.4f\n"
-                "SAVE_VARIABLE VARIABLE=lidar_pa VALUE=%.4f" % (
-                    pa["pa"], pa["pa"]))
-            say("LiDAR pressure advance: %.4f (%s, saved as lidar_pa)"
-                % (pa["pa"], r.get("pa_method")))
-        else:
+        if pa is not None and pa.get("ok"):
+            self._pf_save_pa(pa, r.get("pa_method"))
+            self._bench_supersede("pa")
+        elif pa is not None:
             say("LiDAR PA not saved: %s" % (pa.get("reason"),))
-        name = t.get("filament_name") or t.get("filament_type") or "unknown"
-        key = name.replace(" ", "_").replace('"', "").replace("'", "")
-        if fl.get("ok") and not t.get("flow_save"):
-            # experimental: on the K1 Max the camera flow read ~4 % low
-            # against a printed check, so it is only saved when asked for
-            say("LiDAR flow for %s: %.3f (sd %.3f), experimental, NOT saved"
-                " (LIDAR_PA_FLOW_CALIBRATE FLOW_SAVE=1 saves it; then"
-                " _LIDAR_FLOW_APPLY sets M221 S%.1f at print start)" % (
-                    key, fl["f"], fl.get("sd") or 0.0, 100.0 / fl["f"]))
-        elif fl.get("ok"):
-            sv = self._saved()
-            z = float((sv.get("fl_zoffset") or {}).get(key, 0.0))
-            saved = dict(sv.get("lidar_flow") or {})
-            saved[key] = {"f": fl["f"], "dfdh": fl["dfdh"], "z": round(z, 4),
-                          "t": time.strftime("%Y-%m-%d")}
-            self.gcode.run_script_from_command(
-                'SAVE_VARIABLE VARIABLE=lidar_flow VALUE="%s"'
-                % (repr(saved).replace(" ", ""),))
-            say("LiDAR flow for %s: %.3f (sd %.3f), experimental, saved ->"
-                " M221 S%.1f at print start (keep the slicer's flow ratio at"
-                " 1.0)" % (
-                    key, fl["f"], fl.get("sd") or 0.0, 100.0 / fl["f"]))
-        else:
-            say("LiDAR flow not saved: %s" % (fl.get("reason"),))
+        key, method = self._pf_key(t), r.get("flow_method")
+        if method in ("ir", "lidar"):
+            fl = r.get("flow") or {}
+            if fl.get("ok"):
+                self._pf_save_flow(key, fl, method)
+                self._bench_supersede("flow", key)
+            else:
+                say("LiDAR flow not saved: %s" % (fl.get("reason"),))
+        bench = {}
+        if r.get("pa_mode") == "both":
+            bench["pa"] = pas
+        if method == "both":
+            bench["flow"] = flows
+        if bench:
+            self._pf_benchmark(key, t, bench)
         if r.get("html"):
-            say("LiDAR PA/flow report: %s" % (r["html"],))
+            say("LiDAR calibration report: %s" % (r["html"],))
+
+    def _pf_save_pa(self, pa, how):
+        self.gcode.run_script_from_command(
+            "SET_PRESSURE_ADVANCE ADVANCE=%.4f\n"
+            "SAVE_VARIABLE VARIABLE=lidar_pa VALUE=%.4f" % (pa["pa"], pa["pa"]))
+        self.gcode.respond_info("LiDAR pressure advance: %.4f (%s, kept until"
+                                " UNLOAD_FILAMENT)" % (pa["pa"], how))
+
+    BENCH_FILE = "flow_benchmark.json"
+    BENCH_WHAT = (("pa", "PA", "LIDAR_PA_SAVE", lambda v: "%.4f" % v["pa"]),
+                  ("flow", "flow", "LIDAR_FLOW_SAVE",
+                   lambda v: "%.0f %%" % (v["flow"] * 100)))
+    BENCH_HOW = (("ir", "IR", "camera"), ("lidar", "LIDAR", "LiDAR"))
+
+    def _pf_benchmark(self, key, t, bench):
+        """Keep the benchmark's results for LIDAR_PA_SAVE / LIDAR_FLOW_SAVE
+        and ask in Fluidd which to save (Klipper's action:prompt; any
+        screen: type the command)."""
+        b = {"job": t["job"], "key": key, "results": bench, "saved": [],
+             "filament_name": t.get("filament_name") or ""}
+        self._bench_write(b)
+        for what, label, cmd, fmt in self.BENCH_WHAT:
+            if what not in bench:
+                continue
+            res = bench[what]
+            self.gcode.respond_info(
+                "LiDAR %s benchmark for %s: %s. Nothing saved: %s METHOD=IR"
+                " or METHOD=LIDAR saves the one you trust." % (
+                    label, key, ", ".join("%s %s" % (n, fmt(res[m]) if res.get(
+                        m, {}).get("ok") else "no result")
+                        for m, _, n in self.BENCH_HOW), cmd))
+        self._bench_prompt(b)
+
+    def _bench_write(self, b):
+        with open(os.path.join(self.data_dir, self.BENCH_FILE), "w") as f:
+            json.dump(b, f)
+
+    def _bench_read(self):
+        try:
+            with open(os.path.join(self.data_dir, self.BENCH_FILE)) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def _bench_supersede(self, what, key=None):
+        """A normal calibration saved `what` (for filament key, flow): an
+        older benchmark's value of it must not overwrite that later. (Runs
+        before this job's own benchmark is written: the file is older.)"""
+        b = self._bench_read()
+        if not b or what not in (b.get("results") or {}):
+            return
+        if key is not None and b.get("key") != key:
+            return
+        b["superseded"] = sorted(set(b.get("superseded", [])) | set([what]))
+        try:
+            self._bench_write(b)
+        except OSError:
+            pass
+
+    def _bench_prompt(self, b):
+        """The save prompt for what the benchmark measured and isn't saved
+        yet; closed when nothing is left."""
+        buttons = []
+        for what, label, cmd, fmt in self.BENCH_WHAT:
+            res = b["results"].get(what)
+            if res is None or what in b["saved"] or what in b.get(
+                    "superseded", []):
+                continue
+            for m, M, n in self.BENCH_HOW:
+                if res.get(m, {}).get("ok"):
+                    buttons.append("Save %s %s (%s)|%s METHOD=%s" % (
+                        label, n, fmt(res[m]), cmd, M))
+        if not buttons:
+            self.gcode.run_script_from_command(
+                'RESPOND TYPE=command MSG="action:prompt_end"')
+            return
+        g = ['RESPOND TYPE=command MSG="action:prompt_begin LiDAR benchmark'
+             ' (%s)"' % (b["key"],)]
+        g += ['RESPOND TYPE=command MSG="action:prompt_button %s|%s"' % (
+            x, "primary" if i == 0 else "secondary")
+            for i, x in enumerate(buttons)]
+        g += ['RESPOND TYPE=command MSG="action:prompt_footer_button Close'
+              '|RESPOND TYPE=command MSG=action:prompt_end"',
+              'RESPOND TYPE=command MSG="action:prompt_show"']
+        self.gcode.run_script_from_command("\n".join(g))
+
+    def _bench_pick(self, gcmd, what):
+        """(benchmark, chosen result) for LIDAR_PA_SAVE / LIDAR_FLOW_SAVE."""
+        cmd = "LIDAR_%s_SAVE" % (what.upper(),)
+        method = {"IR": "ir", "LIDAR": "lidar"}.get(
+            gcmd.get("METHOD", "").upper())
+        if method is None:
+            raise gcmd.error("%s: METHOD=IR or METHOD=LIDAR" % (cmd,))
+        b = self._bench_read()
+        res = (b.get("results") or {}).get(what)
+        if res is None:
+            raise gcmd.error("%s: the last benchmark measured no %s (%s"
+                             " METHOD=BOTH)" % (cmd, what, "LIDAR_%s_CALIBRATION"
+                                                % (what.upper(),)))
+        # a stale benchmark (old prompt button): refused, FORCE=1 saves
+        if not gcmd.get_int("FORCE", 0):
+            job = b.get("job")
+            if what in b.get("superseded", []):
+                raise gcmd.error(
+                    "%s: a newer %s calibration was saved after benchmark %s;"
+                    " not saved (FORCE=1 saves it anyway)" % (cmd, what, job))
+            if what in b.get("saved", []):
+                raise gcmd.error(
+                    "%s: the %s of benchmark %s is already saved (FORCE=1"
+                    " saves again)" % (cmd, what, job))
+            cur = self._pf_key({"filament_name": str(
+                self._saved().get("last_filament_name", "") or "")})
+            if b.get("filament_name") and cur != "unknown" and \
+                    cur != self._pf_key(b):
+                raise gcmd.error(
+                    "%s: benchmark %s was for %s, the filament now is %s;"
+                    " not saved (FORCE=1 saves it anyway)" % (
+                        cmd, job, b.get("key"), cur))
+        v = res.get(method) or {}
+        if not v.get("ok"):
+            raise gcmd.error("%s: the %s gave no %s in benchmark %s (%s)" % (
+                cmd, method, what, b.get("job"), v.get("reason")))
+        return b, method, v
+
+    def _bench_saved(self, b, what):
+        b["saved"] = sorted(set(b.get("saved", [])) | set([what]))
+        self._bench_write(b)
+        self._bench_prompt(b)
+
+    def cmd_LIDAR_PA_SAVE(self, gcmd):
+        b, method, v = self._bench_pick(gcmd, "pa")
+        self._pf_save_pa(v, {"ir": "camera", "lidar": "LiDAR"}[method])
+        self._bench_saved(b, "pa")
+
+    def cmd_LIDAR_FLOW_SAVE(self, gcmd):
+        b, method, v = self._bench_pick(gcmd, "flow")
+        self._pf_save_flow(b["key"], v, method)
+        self._bench_saved(b, "flow")
 
     # ------------------------------------------- Creality's PA test pattern
     desc_LIDAR_PA_CREALITY = "Print Creality's pressure advance test pattern"

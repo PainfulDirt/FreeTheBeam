@@ -9,6 +9,14 @@
 #   lidar_service.py --printer PRINTER_IP:7130 | --socket /tmp/ai_server_uds
 #                    [--listen 0.0.0.0:7131]
 #                    [--data /var/lib/k1-lidar] [--allow PRINTER_IP]
+#                    [--profile helper|printer]
+#
+# On the printer itself (local mode: no helper computer; Python 3.8, no
+# numpy: the camera and flow-band calibrations are refused):
+#   lidar_service.py --socket /tmp/ai_server_uds --listen 127.0.0.1:7131
+#       --allow 127.0.0.1 --data /usr/data/printer_data/lidar
+#       --profile printer
+# and [lidar] service: 127.0.0.1:7131
 #
 # Requests and replies are one JSON object per line.
 #
@@ -17,8 +25,10 @@ import argparse
 import array
 import json
 import os
+import re
 import socket
 import socketserver
+import stat
 import threading
 import time
 
@@ -45,39 +55,170 @@ class Middleware:
                 pass
         self.sock = None
 
+    def _connect(self, timeout):
+        """A new connection: TCP ("host", port) to lidar-bridge.py, or a
+        path (optionally "unix:/path") = the driver's own unix socket (the
+        driver on this host, e.g. the service on the printer itself)."""
+        if isinstance(self.addr, str):
+            path = self.addr[5:] if self.addr.startswith("unix:") \
+                else self.addr
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(timeout)
+                sock.connect(path)
+            except BaseException:
+                sock.close()
+                raise
+            return sock
+        sock = socket.create_connection(self.addr, timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return sock
+
     def call(self, msg, timeout=15.0):
+        """One request, one reply; `timeout` bounds the whole call. Sent
+        again (once) only when the old persistent connection turned out
+        dead before any answer came: never after a timeout or a bad reply
+        (the command reached the driver; self_test, photos etc. are not
+        safe to repeat)."""
+        deadline = time.monotonic() + timeout
         err = None
         for attempt in range(2):
+            reused = self.sock is not None
             try:
-                if self.sock is None and isinstance(self.addr, str):
-                    self.sock = socket.socket(socket.AF_UNIX,
-                                              socket.SOCK_STREAM)
-                    self.sock.settimeout(5.0)
-                    self.sock.connect(self.addr)
-                elif self.sock is None:
-                    self.sock = socket.create_connection(self.addr, 5.0)
-                    self.sock.setsockopt(socket.IPPROTO_TCP,
-                                         socket.TCP_NODELAY, 1)
-                self.sock.settimeout(timeout)
+                if self.sock is None:
+                    self.sock = self._connect(max(0.1, min(
+                        5.0, deadline - time.monotonic())))
+                self.sock.settimeout(max(0.1, deadline - time.monotonic()))
                 self.sock.sendall(json.dumps(msg).encode() + ETX)
                 buf = b""
                 while not buf.endswith(ETX):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise socket.timeout("timed out")
+                    self.sock.settimeout(left)
                     d = self.sock.recv(1 << 20)
                     if not d:
-                        raise OSError("connection closed")
+                        raise ConnectionResetError("connection closed")
                     buf += d
                 return json.loads(buf[:-1].decode(errors="replace"))
-            except (OSError, ValueError) as e:
+            except socket.timeout as e:
+                self.close()
+                raise RuntimeError("no answer from the LiDAR driver (%s)"
+                                   % (e,))
+            except ValueError as e:
+                self.close()
+                raise RuntimeError("bad reply from the LiDAR driver (%s)"
+                                   % (e,))
+            except OSError as e:
                 err = e
                 self.close()
+                # a fresh connection that failed, or no time left: give up
+                if not reused or time.monotonic() >= deadline:
+                    break
         raise RuntimeError("no answer from the LiDAR driver (%s)" % (err,))
 
 
+_NAME_OK = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+
+
+class BadName(ValueError):
+    pass
+
+
+def safe_name(v, what="name"):
+    """A request value used as a file name under --data: only
+    [A-Za-z0-9_.-], no leading dot, no '/' (raises BadName)."""
+    v = str(v)
+    if not _NAME_OK.match(v) or ".." in v:
+        raise BadName("bad %s %r (allowed: A-Z a-z 0-9 _ . -, no leading"
+                      " dot)" % (what, v))
+    return v
+
+
+# request keys that end up in file names (checked before any command runs)
+NAME_KEYS = ("name", "job", "scan", "base", "fl", "sk", "mesh")
+
+
+def _timeout(req, default):
+    """The K1's timeout for this request (if it sent one), a bit shorter so
+    the reply still reaches it, else the default."""
+    t = req.get("timeout")
+    if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0:
+        return max(0.5, min(float(t) - 1.0, 600.0))
+    return default
+
+
+def trim_dir(data_dir, limit, min_age=600.0):
+    """Keep the data folder (with its sub folders) at most `limit` bytes:
+    delete our own files (.json .html .jsonl .jpg), oldest first. Files
+    younger than `min_age` s (the running job's) and anything else (links,
+    other names) are never touched; nothing outside the folder. Returns
+    the bytes removed."""
+    files, total = [], 0
+    for root, dirs, names in os.walk(data_dir):    # never follows links
+        for n in names:
+            p = os.path.join(root, n)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):      # links, sockets ...
+                continue
+            total += st.st_size
+            if n.endswith((".json", ".html", ".jsonl", ".jpg")):
+                files.append((st.st_mtime, p, st.st_size))
+    if total <= limit:
+        return 0
+    removed = 0
+    young = time.time() - min_age
+    for mtime, p, size in sorted(files):
+        if total <= limit or mtime > young:
+            break
+        try:
+            os.remove(p)
+        except OSError:
+            continue
+        total -= size
+        removed += size
+    return removed
+
+
+class _NullRaw:
+    """--profile printer: no raw capture files (2.6-12 MB each, offline work
+    only)."""
+
+    def write(self, data):
+        pass
+
+    def close(self):
+        pass
+
+
 class Service:
-    def __init__(self, mw, data_dir):
+    # scans kept in memory (rows as float32: a 126 mm PA strip at 0.4 mm is
+    # ~0.75 MB); one PA+flow calibration print makes 14, and the scans of
+    # the running calibration job (pf_*) are never evicted
+    KEEP_SCANS = 16
+
+    def __init__(self, mw, data_dir, profile="helper"):
         self.mw = mw
         self.data_dir = data_dir
+        self.profile = profile
+        # a helper keeps the raw captures; the printer itself (--profile
+        # printer; the K1 Max has ~130 MB RAM free, a shared /usr/data)
+        # keeps 6 scans, no raw files and its data folder trimmed to the
+        # newest 200 MB
+        self.raw_files = True
+        self.trim_bytes = 0
+        if profile == "printer":
+            self.KEEP_SCANS = 6
+            self.raw_files = False
+            self.trim_bytes = 200 * 1024 * 1024
         self.scans = {}
+        # calibration job generation: pf_plan starts a new one; scans begun
+        # since then belong to that job (stale strips of an earlier job are
+        # never analysed as this one's)
+        self.pf_gen = 0
         # fine bed mesh being collected: name -> [(x, ys, grouped rows)]
         self.strips = {}
         # first-layer checks: id -> {"before"/"after": {x: {y: groups}}}
@@ -100,34 +241,94 @@ class Service:
                     pass
 
     def handle(self, req):
+        try:
+            for k in NAME_KEYS:
+                if k in req:
+                    req[k] = safe_name(req[k], k)
+            return self._handle(req)
+        except BadName as e:
+            if req.get("cmd") == "frame":
+                raise              # frames get no reply (Handler logs it)
+            return {"ok": False, "error": str(e)}
+        except ImportError as e:
+            # camera / flow bands on a machine without numpy/PIL (the
+            # service on the printer itself, local mode)
+            if req.get("cmd") == "frame":
+                raise
+            return {"ok": False, "error": "%s needs the helper on a computer"
+                    " with numpy/PIL (not on this machine: %s)" % (req.get("cmd"), e)}
+
+    def trim(self):
+        """--profile printer: the data folder back under trim_bytes."""
+        if self.trim_bytes:
+            n = trim_dir(self.data_dir, self.trim_bytes)
+            if n:
+                print("data folder trimmed: %.1f MB removed" % (n / 1e6,),
+                      flush=True)
+
+    def bad_frame(self, name, err):
+        """A frame that could not be used: logged and counted on its scan
+        (frames never get a reply: the K1 doesn't read one)."""
+        s = self.scans.get(name) if isinstance(name, str) else None
+        n = 0
+        if s is not None:
+            n = s["bad_frames"] = s.get("bad_frames", 0) + 1
+        if n <= 3:
+            print("bad frame for scan %r (#%d): %s" % (name, n, err),
+                  flush=True)
+
+    def _evict(self):
+        # keep memory bounded: drop the oldest scans, but not the running
+        # calibration job's own
+        while len(self.scans) >= self.KEEP_SCANS:
+            old = next((n for n, s in self.scans.items()
+                        if not (n.startswith("pf_")
+                                and s.get("gen") == self.pf_gen)), None)
+            if old is None:
+                break
+            sc = self.scans.pop(old)
+            if sc.get("raw"):
+                sc["raw"].close()
+
+    def _handle(self, req):
         cmd = req.get("cmd")
         if cmd == "ping":
             return {"ok": True}
         if cmd == "middleware":
-            return {"ok": True, "reply": self.mw.call(req["msg"])}
+            return {"ok": True, "reply": self.mw.call(
+                req["msg"], _timeout(req, 15.0))}
         if cmd == "begin":
             name = req["name"]
-            self.laser(True, req.get("level", 0))
-            raw = open(os.path.join(self.data_dir, name + ".raw.jsonl"), "w")
-            raw.write(json.dumps({k: req[k] for k in (
-                "x", "z", "x_dir", "x_offset", "y_offset")}) + "\n")
-            # keep memory bounded
-            while len(self.scans) >= 6:
-                old = self.scans.pop(next(iter(self.scans)))
-                if old.get("raw"):
-                    old["raw"].close()
+            old = self.scans.pop(name, None)    # re-begin: a new scan
+            if old is not None and old.get("raw"):
+                old["raw"].close()
+            self._evict()
+            # the file first: a full disk must not leave the laser on
+            raw = open(os.path.join(self.data_dir, name + ".raw.jsonl"),
+                       "w") if self.raw_files else _NullRaw()
+            try:
+                raw.write(json.dumps({k: req[k] for k in (
+                    "x", "z", "x_dir", "x_offset", "y_offset")}) + "\n")
+                self.laser(True, req.get("level", 0))
+            except BaseException:
+                raw.close()
+                self.laser(False)
+                raise
             self.scans[name] = {"x": req["x"], "z": req["z"],
                                 "x_dir": req["x_dir"], "ys": [], "rows": [],
                                 "captures": req.get("captures", 3),
                                 "grid": req.get("grid"),
                                 "path": req.get("path"), "frames": [],
-                                "raw": raw, "t0": time.time()}
+                                "raw": raw, "t0": time.time(),
+                                "gen": self.pf_gen, "job": req.get("job")}
             return {"ok": True}
         if cmd == "frame":
             # dwell scan: one frame for grid row "row", taken standing still;
             # moving scan: the frame comes with where it looked (x, y: the
             # middle of its window, span: how far it moved meanwhile)
             s = self.scans[req["name"]]
+            if s.get("raw") is None:
+                raise ValueError("scan %s already ended" % (req["name"],))
             pc = req["raw"].get("result", {}).get("point_cloud", [])
             if "y" in req:
                 s["path"].append([req["x"], req["y"]])
@@ -161,8 +362,11 @@ class Service:
             s["rows"].append(lidar.reduce_caps(caps))
             return {"ok": True, "points": sum(len(c) for c in caps)}
         if cmd == "end":
-            s = self.scans[req["name"]]
-            self.laser(False)
+            self.laser(False)          # whatever happens below
+            s = self.scans.get(req["name"])
+            if s is None or s.get("raw") is None:
+                return {"ok": False, "error": "scan %s not here (or ended)"
+                        % (req["name"],)}
             s["raw"].close()
             s["raw"] = None
             if s["path"] is not None:
@@ -177,12 +381,15 @@ class Service:
                 if s.get("moves"):
                     self.save_moving(req["name"], s)
             elif s["grid"]:
-                s["ys"], s["rows"] = fill_rows(s["frames"], *s["grid"])
+                ys, rows = fill_rows(s["frames"], *s["grid"])
+                s["ys"] = ys
+                s["rows"] = [array.array("f", r) for r in rows]
                 s["n_frames"] = len(s["frames"])
                 s["frames"] = []
             self.save(req["name"], s)
             return {"ok": True, "rows": len(s["ys"]),
                     "frames": s.get("n_frames"),
+                    "bad_frames": s.get("bad_frames", 0),
                     "seconds": round(time.time() - s["t0"], 1)}
         if cmd == "pa_analyze":
             base = self.scans.get(req["base"])
@@ -292,9 +499,10 @@ class Service:
             if fl is None:
                 return {"ok": False, "error": "check %s not here" % (
                     req["fl"],)}
-            return {"ok": True, "result": fl_report(
-                self.data_dir, req["fl"], req["plan"], fl, req.get("meta")
-                or {})}
+            res = fl_report(self.data_dir, req["fl"], req["plan"], fl,
+                            req.get("meta") or {})
+            self.trim()
+            return {"ok": True, "result": res}
         if cmd == "skew_strip":
             # SKEW_SCAN: the strips of one scan, every bin (the sides along
             # Y are found along the profile)
@@ -323,6 +531,7 @@ class Service:
             d = os.path.join(self.data_dir, "skew")
             scans = []
             for n in req["names"]:
+                n = safe_name(n, "skew scan")
                 try:
                     with open(os.path.join(d, n + ".json")) as f:
                         s = json.load(f)
@@ -342,7 +551,8 @@ class Service:
             # MESH_BENCHMARK: the run as JSON + an HTML page, kept per run
             d = os.path.join(self.data_dir, "benchmarks")
             os.makedirs(d, exist_ok=True)
-            stamp = req["run"].get("stamp") or time.strftime("%Y%m%d-%H%M%S")
+            stamp = safe_name(req["run"].get("stamp")
+                              or time.strftime("%Y%m%d-%H%M%S"), "stamp")
             base = os.path.join(d, "bench-%s" % (stamp,))
             with open(base + ".json", "w") as f:
                 json.dump(req["run"], f)
@@ -357,6 +567,7 @@ class Service:
             return self.photo(req)
         if cmd == "pf_plan":
             import lidar_pa_flow
+            self.pf_gen += 1        # a new calibration job starts
             return dict(lidar_pa_flow.plan_pa_flow(req["params"]), ok=True)
         if cmd == "offset_plan":
             import lidar_pa_flow
@@ -406,11 +617,12 @@ class Service:
         """One fill-light (or laser) picture through the driver, stored as
         photos/<job>/<name>.jpg with its pose."""
         import base64
+        import lidar_camera   # numpy/PIL: refused before any picture
         t0 = time.time()
         r = self.mw.call({"control": "ir_photo", "light": req.get("light", 1),
                           "laser": req.get("laser", 0),
                           "exposure": req.get("exposure", 1000), "res": 3},
-                         timeout=40.0)
+                         timeout=_timeout(req, 40.0))
         res = r.get("result", {})
         if res.get("code") or "jpeg" not in res:
             return {"ok": False, "error": "photo %s failed (code %s)" % (
@@ -426,7 +638,6 @@ class Service:
         with open(os.path.join(d, req["name"] + ".json"), "w") as f:
             json.dump(meta, f)
         try:
-            import lidar_camera
             med = float(lidar_camera.np.median(lidar_camera.load_gray(data)))
         except Exception:     # the picture is stored; brightness is a hint
             med = None
@@ -443,6 +654,7 @@ class Service:
         for p in req["photos"]:
             imgs = []
             for kind in ("light", "laser"):
+                safe_name(p[kind], "photo")
                 with open(os.path.join(d, p[kind] + ".jpg"), "rb") as f:
                     imgs.append(cam.load_gray(f.read()))
                 with open(os.path.join(d, p[kind] + ".json")) as f:
@@ -472,80 +684,77 @@ class Service:
 
     def pf_analyze(self, req):
         """LIDAR_PA_FLOW_CALIBRATE's analysis: PA from the photos at the
-        speed changes, flow from the triplet photos and the bare strips."""
+        speed changes and/or the LiDAR strips over the PA lines (pas = every
+        method's result, pa = the one to save, None for the benchmark),
+        flow from the bands (camera photos and/or the bare
+        and printed LiDAR strips, lidar_bands.py). flows = every method's
+        result; flow = the one to save (None for the benchmark: the user
+        chooses)."""
         import numpy as np
         import lidar_camera as cam
         test, job = req["test"], str(req["job"])
+        for ph in test.get("photos") or []:
+            safe_name(ph["name"], "photo")
+        for st in test.get("strips") or []:
+            safe_name(st["name"], "strip")
         d = os.path.join(self.data_dir, "photos", job)
 
-        def photos(prefix):
+        def photos(names):
             out = []
             for ph in test["photos"]:
                 fn = os.path.join(d, ph["name"] + ".jpg")
-                if ph["name"].startswith(prefix) and os.path.exists(fn):
+                if ph["name"] in names and os.path.exists(fn):
                     with open(fn, "rb") as f:
                         out.append({"img": cam.load_gray(f.read()),
                                     "x": ph["x"], "y": ph["y"],
                                     "name": ph["name"]})
             return out
-        tp, fp = photos("T"), photos("F")
-        pa_xs = [test["pa"]["x0"] + i * test["pa"]["pitch"]
-                 for i in range(len(test["pa"]["pa"]))]
-        fl_xs = [ln["x"] for g in test["flow"]["groups"] for ln in g["lines"]]
-        con = [cam.line_contrast(p["img"], cam.find_lines(p["img"], pa_xs, p["x"]))
-               for p in tp] + \
-            [cam.line_contrast(p["img"], cam.find_lines(p["img"], fl_xs, p["x"]))
-             for p in fp]
-        contrast = float(np.median(con)) if con else 0.0
-        low = contrast < cam.MIN_CONTRAST
-        # PA: camera, else the LiDAR scans when the bare step took them
-        pa = cam.pa_from_widths(tp, test["pa"]) if tp and not low else {
-            "ok": False, "reason": "camera contrast too low (%.0f grey"
-            " levels)" % (contrast,), "report": []}
-        method = "camera" if pa.get("ok") else "none"
-        if not pa.get("ok") and "pf_pa_base" in self.scans \
-                and "pf_pa_scan" in self.scans:
-            lr = self.handle({"cmd": "pa_analyze", "base": "pf_pa_base",
-                              "scan": "pf_pa_scan", "test": test["pa"]})
-            if lr.get("ok") and lr["result"].get("ok"):
-                pa, method = dict(lr["result"], camera_reason=pa.get(
-                    "reason")), "lidar"
-        # flow
-        if low or len(fp) < len(test["photos"]) - len(tp) or not fp:
-            flow = {"ok": False, "reason": "camera contrast too low (%.0f grey"
-                    " levels)" % (contrast,) if low else "flow photos"
-                    " missing", "report": []}
-        else:
-            fl = test["flow"]
-            ys = list(np.arange(fl["y0"] + 8.0, fl["y1"] - 7.0 + 1e-6, 1.0))
-            tables = req.get("tables") or {}
-            samples, notes = {}, []
-            for st in test["strips"]:
-                k = int(st["name"].rsplit("g", 1)[1])
-                ms = req.get("mesh", {}).get(st["name"])
-                try:
-                    hdr, rows = self._raw_rows(st["name"])
-                except (OSError, ValueError):
-                    notes.append("strip %s missing" % (st["name"],))
-                    continue
-                if not ms:
-                    notes.append("no mesh samples for %s" % (st["name"],))
-                    continue
-                my, mz = np.array(ms, float).T
-                samples[k] = cam.gap_pairs(
-                    rows, hdr.get("x", st["x"]), ys,
-                    lambda x, y: float(np.interp(y, my, mz)),
-                    tables.get("twist"), tables.get("ytwist"))
-            gaps = cam.group_gaps(samples)
-            flow = cam.flow_fit(cam.flow_widths(fp, fl), gaps,
-                                h0=fl.get("height", 0.2),
-                                w_nom=fl.get("width", 0.45),
-                                h_nom=fl.get("height", 0.2))
-            flow["gaps_um"] = dict((str(k), round(v * 1000, 1))
-                                   for k, v in gaps.items())
-            flow["notes"] = notes
-        res = {"pa": pa, "pa_method": method, "flow": flow,
-               "contrast": round(contrast, 1), "job": job}
+        pa, method, contrast, pas, pmode = None, "none", None, {}, None
+        if "pa" in test:
+            pmode = test["pa"].get("method", "ir")
+            if pmode in ("ir", "both"):
+                tp = photos(["T%d" % (i + 1)
+                             for i in range(len(test["photos"]))])
+                pa_xs = [test["pa"]["x0"] + i * test["pa"]["pitch"]
+                         for i in range(len(test["pa"]["pa"]))]
+                con = [cam.line_contrast(p["img"], cam.find_lines(
+                    p["img"], pa_xs, p["x"])) for p in tp]
+                contrast = float(np.median(con)) if con else 0.0
+                pas["ir"] = cam.pa_from_widths(tp, test["pa"]) \
+                    if tp and contrast >= cam.MIN_CONTRAST else {
+                        "ok": False, "reason": "camera contrast too low (%.0f"
+                        " grey levels)" % (contrast,), "report": []}
+            # the LiDAR PA strips of THIS job only (the K1 says whether it
+            # scanned them: t["lidar_pa"])
+            have_scans = self._job_scans(job, "pf_pa_base", "pf_pa_scan") \
+                and test.get("lidar_pa") is not False
+            if pmode in ("lidar", "both") or (
+                    have_scans and not pas["ir"].get("ok")):
+                pas["lidar"] = self._pa_lidar(test, job)
+            if pmode == "ir":
+                # camera, else the LiDAR when the bare step scanned (bright
+                # plate) and it found the PA
+                pa, method = pas["ir"], "camera" if pas["ir"].get("ok") \
+                    else "none"
+                if not pa.get("ok") and pas.get("lidar", {}).get("ok"):
+                    pa, method = dict(pas["lidar"], camera_reason=pa.get(
+                        "reason")), "lidar"
+            elif pmode == "lidar":
+                pa = pas["lidar"]
+                method = "lidar" if pa.get("ok") else "none"
+        flows, flow, fmethod = {}, None, None
+        if "flow" in test:
+            fmethod = test["flow"].get("method", "ir")
+            if fmethod in ("ir", "both"):
+                flows["ir"] = self._bands_camera(test, photos)
+            if fmethod in ("lidar", "both"):
+                flows["lidar"] = self._bands_lidar(test, job)
+            if fmethod != "both":
+                flow = flows[fmethod]
+        res = {"pa": pa, "pa_method": method, "pas": pas, "pa_mode": pmode,
+               "flow": flow, "flows": flows,
+               "flow_method": fmethod, "contrast": None if contrast is None
+               else round(contrast, 1), "job": job}
         base = os.path.join(self.data_dir, "pf-%s" % (job,))
         with open(base + ".json", "w") as f:
             json.dump(res, f)
@@ -553,6 +762,71 @@ class Service:
             f.write(pf_html(res, test, job))
         res.update(ok=True, html=base + ".html")
         return res
+
+    def _job_scans(self, job, *names):
+        """Every named scan is here, ended, and from calibration job `job`
+        (the job id it was begun with, else begun since this job's
+        pf_plan)."""
+        for n in names:
+            s = self.scans.get(n)
+            if s is None or s.get("raw") is not None:
+                return False
+            if s.get("job") is not None:
+                if str(s["job"]) != job:
+                    return False
+            elif s.get("gen") != self.pf_gen:
+                return False
+        return True
+
+    def _pa_lidar(self, test, job):
+        """PA from the bare and printed LiDAR strips over the PA lines."""
+        if not self._job_scans(job, "pf_pa_base", "pf_pa_scan"):
+            return {"ok": False, "reason": "LiDAR PA strips of this job"
+                    " missing", "report": []}
+        lr = self.handle({"cmd": "pa_analyze", "base": "pf_pa_base",
+                          "scan": "pf_pa_scan", "test": test["pa"]})
+        if not lr.get("ok"):
+            return {"ok": False, "reason": lr.get("error"), "report": []}
+        return lr["result"]
+
+    BAND_MIN_MEDIAN = 10.0     # grey levels: darker band photos aren't judged
+
+    def _bands_camera(self, test, photos):
+        import lidar_bands as lb
+        bands = test["flow"]["bands"]
+        got = dict((p["name"], p) for p in photos([b["name"] for b in bands]))
+        if len(got) < len(bands):
+            return {"ok": False, "reason": "band photos missing (%d of %d)" % (
+                len(got), len(bands)), "report": []}
+        out = []
+        for b in bands:
+            m = lb.band_metrics(got[b["name"]]["img"])
+            if m["median"] < self.BAND_MIN_MEDIAN:
+                return {"ok": False, "reason": "band photo %s too dark (median"
+                        " %.0f)" % (b["name"], m["median"]), "report": []}
+            out.append(dict(((k, round(v, 3)) for k, v in m.items()),
+                            flow=b["flow"]))
+        return lb.pick_camera(out)
+
+    def _bands_lidar(self, test, job):
+        import lidar_bands as lb
+        out = []
+        for st, b in zip(test["strips"], test["flow"]["bands"]):
+            stale = [n for n in (st["name"], st["name"] + "_after")
+                     if n in self.scans and not self._job_scans(job, n)]
+            if stale:
+                return {"ok": False, "reason": "LiDAR scan %s is from another"
+                        " job" % (stale[0],), "report": []}
+            try:
+                hdr, before = self._raw_rows(st["name"])
+                _, after = self._raw_rows(st["name"] + "_after")
+            except (OSError, ValueError):
+                return {"ok": False, "reason": "LiDAR scan of band %s missing"
+                        % (b["name"],), "report": []}
+            m = lb.lidar_band_metrics(before, after, hdr.get("x", st["x"]),
+                                      hdr.get("x_dir", -1.0), b)
+            out.append(dict(m, flow=b["flow"]))
+        return lb.pick_lidar(out)
 
     def save_mesh(self, req, res):
         # the last mesh, and every mesh with a time stamp in meshes/: same
@@ -567,6 +841,7 @@ class Service:
         with open(os.path.join(d, "mesh-%s.json" % (
                 time.strftime("%Y%m%d-%H%M%S"),)), "w") as f:
             json.dump(res, f)
+        self.trim()
 
     def save_moving(self, name, s, keep=20):
         """A small replay file per moving scan (meshes/moving-<stamp>.json):
@@ -587,6 +862,7 @@ class Service:
         old = sorted(n for n in os.listdir(d) if n.startswith("moving-"))
         for n in old[:-keep]:
             os.remove(os.path.join(d, n))
+        self.trim()
 
     def save(self, name, s):
         # same compact format as lidar.py writes on the printer
@@ -597,6 +873,7 @@ class Service:
                        "bin_min": lidar.BIN_MIN,
                        "rows": [[int(v * 1000) if v == v else -1 for v in r]
                                 for r in s["rows"]]}, f)
+        self.trim()
 
 
 def _bilinear(m, x, y):
@@ -698,6 +975,14 @@ def fl_html(meta, plan, res, tmap):
     """First-layer check page: numbers and the thickness map (2mm cells,
     thickness - sliced height, +-0.1mm; the bare plate shows dark blue)."""
     h0 = plan["height"]
+    # tilt (or one axis of it) is None when it can't be fitted (one row /
+    # one column of cells)
+    tl = res.get("tilt_um_per_100mm") or (None, None)
+    tilt = "X %s, Y %s um/100mm" % tuple(
+        "n/a" if v is None else "%+.0f" % v for v in tuple(tl)[:2])
+    pl = (res.get("drift") or {}).get("plane")
+    drift = "n/a" if not pl or pl[0] is None else "%+.0f um" % (
+        pl[0] * 1000.0,)
     t = tmap["t"]
     k = max(1, int(round(plan.get("step", 2.0) / tmap["dx"])))
     vals = []
@@ -714,16 +999,14 @@ def fl_html(meta, plan, res, tmap):
             "</title><body style='font:14px sans-serif;max-width:900px;"
             "margin:20px auto'><h2>First layer: %.3f mm measured, %.3f mm"
             " sliced (%+.3f)</h2><p>%s, %s, %s. p05-p95 %.3f-%.3f mm over"
-            " %.0f mm&sup2;; thickness tilt X %+.0f, Y %+.0f um/100mm;"
-            " plate drift between the scans %+.0f um.</p><table border=1"
+            " %.0f mm&sup2;; thickness tilt %s;"
+            " plate drift between the scans %s.</p><table border=1"
             " cellpadding=4><tr><th>object</th><th>median mm</th><th>cells"
             "</th></tr>%s</table>%s</body>" % (
                 meta.get("time", ""), res["median"], h0, res["error"],
                 meta.get("file") or "", meta.get("filament_name")
                 or meta.get("filament") or "", meta.get("time", ""),
-                res["p05"], res["p95"], res["area_mm2"],
-                res["tilt_um_per_100mm"][0], res["tilt_um_per_100mm"][1],
-                res["drift"]["plane"][0] * 1000.0, rows,
+                res["p05"], res["p95"], res["area_mm2"], tilt, drift, rows,
                 _heat_svg(vals, tmap["x0"], plan["ys"][0], step, 0.1,
                           "thickness - %.2f mm (red thicker, blue thinner;"
                           " bare plate dark blue)" % (h0,))))
@@ -731,12 +1014,12 @@ def fl_html(meta, plan, res, tmap):
 
 def pf_html(res, test, job):
     """LIDAR_PA_FLOW_CALIBRATE report: results, the PA scores against PA
-    (inline SVG), the flow lines, links to the photos."""
-    pa, fl = res["pa"], res["flow"]
-    rows = []
+    (inline SVG), per flow method the bands, links to the photos."""
+    pas, flows = res.get("pas") or {}, res.get("flows") or {}
+    pa = res.get("pa") or pas.get("ir") or pas.get("lidar")
+    svg, rows = "", []
     sc = [(p, s) for p, s in zip(test["pa"]["pa"], pa.get("scores") or [])
-          if s is not None]
-    svg = ""
+          if s is not None] if pa else []
     if sc:
         lo, hi = min(s for p, s in sc), max(s for p, s in sc)
         span = (hi - lo) or 1.0
@@ -747,26 +1030,37 @@ def pf_html(res, test, job):
                       for p, s in sc)
         zero = '<line x1="20" x2="380" y1="%.1f" y2="%.1f" stroke="#888"/>' % (
             Y(0), Y(0)) if lo <= 0 <= hi else ""
-        svg = ('<svg width="400" height="200" style="background:#fff">%s%s'
-               '</svg>' % (zero, pts))
-    for line in (pa.get("report") or []) + (fl.get("report") or []):
-        rows.append("<div><code>%s</code></div>" % (line,))
+        svg = ('<h3>PA score per line (zero crossing = PA)</h3><svg width='
+               '"400" height="200" style="background:#fff">%s%s</svg>' % (
+                   zero, pts))
+    head = []
+    names = {"ir": "camera", "lidar": "LiDAR"}
+    for m, p in sorted(pas.items()):
+        head.append("<h2>PA (%s) %s</h2>" % (
+            names[m], "%.4f" % p["pa"] if p.get("ok") else "not measured: %s"
+            % p.get("reason")))
+        rows += p.get("report") or []
+    if res.get("pa_mode") and res["pa_mode"] != "both":
+        head.append("<p>PA used: %s</p>" % (res["pa_method"],))
+    for m, fl in sorted(flows.items()):
+        head.append("<h2>Flow (%s) %s</h2>" % (
+            names[m], "%.0f %% (f %.4f)" % (fl["flow"] * 100, fl["f"])
+            if fl.get("ok") else "not picked: %s" % (fl.get("reason"),)))
+        rows += fl.get("report") or []
+    if "both" in (res.get("flow_method"), res.get("pa_mode")):
+        head.append("<p>Benchmark: nothing saved. LIDAR_PA_SAVE /"
+                    " LIDAR_FLOW_SAVE METHOD=IR or METHOD=LIDAR saves the one"
+                    " you trust.</p>")
     pics = "".join('<a href="photos/%s/%s.jpg">%s</a> ' % (job, p["name"],
                                                          p["name"])
                    for p in test["photos"])
-    return ("<!doctype html><meta charset=utf-8><title>LiDAR PA + flow %s"
-            "</title><body style='font-family:sans-serif'>"
-            "<h2>PA %s (%s)</h2><h2>Flow %s</h2>"
-            "<p>camera contrast %.0f grey levels; gap differences %s um</p>"
-            "<h3>PA score per line (zero crossing = PA)</h3>%s<h3>Details</h3>"
-            "%s<h3>Photos</h3>%s</body>" % (
-                job, "%.4f" % pa["pa"] if pa.get("ok") else "not measured: %s"
-                % pa.get("reason"), res["pa_method"],
-                "%.3f (sd %.3f, dF/dh %.2f per mm)" % (fl["f"], fl["sd"],
-                                                         fl["dfdh"])
-                if fl.get("ok") else "not saved: %s" % (fl.get("reason"),),
-                res["contrast"], fl.get("gaps_um", {}), svg, "".join(rows),
-                pics))
+    return ("<!doctype html><meta charset=utf-8><title>LiDAR calibration %s"
+            "</title><body style='font-family:sans-serif'>%s%s%s"
+            "<h3>Details</h3>%s<h3>Photos</h3>%s</body>" % (
+                job, "".join(head), "<p>camera contrast %.0f grey levels</p>"
+                % res["contrast"] if res.get("contrast") is not None else "",
+                svg, "".join("<div><code>%s</code></div>" % (l,)
+                             for l in rows), pics))
 
 
 def benchmark_html(run):
@@ -854,26 +1148,61 @@ def fill_rows(frames, y0, y1, step):
     return ys, rows
 
 
+FRAME_LINE = re.compile(rb'\s*\{\s*"cmd"\s*:\s*"frame"')
+FRAME_NAME = re.compile(rb'"name"\s*:\s*"([^"\\]{0,128})"')
+
+
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
         if self.server.allow and self.client_address[0] not in \
                 self.server.allow:
             return
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        for line in self.rfile:
-            if not line.strip():
-                continue
-            try:
-                req = json.loads(line)
-                with self.server.svc.lock:
-                    rep = self.server.svc.handle(req)
-            except Exception as e:   # report, keep serving
-                rep = {"ok": False, "error": "%s: %s" % (
-                    type(e).__name__, e)}
-            if rep is None:          # frames get no reply
-                continue
-            self.wfile.write((json.dumps(rep) + "\n").encode())
-            self.wfile.flush()
+        svc = self.server.svc
+        try:
+            for line in self.rfile:
+                if not line.strip():
+                    continue
+                rep = self.one(svc, line)
+                if rep is None:      # frames get no reply
+                    continue
+                self.wfile.write((json.dumps(rep) + "\n").encode())
+                self.wfile.flush()
+        except OSError as e:         # the K1 went away mid-reply
+            print("connection from %s: %s" % (self.client_address[0], e),
+                  flush=True)
+
+    @staticmethod
+    def one(svc, line):
+        """One request line -> the reply, or None for a frame. Frames are
+        fire-and-forget (the K1 never reads a reply to one): a frame that
+        fails, even one that isn't valid JSON, is logged and counted on its
+        scan, never answered (an answer would shift every later reply)."""
+        try:
+            req = json.loads(line)
+        except ValueError as e:
+            if FRAME_LINE.match(line):
+                m = FRAME_NAME.search(line[:300])
+                with svc.lock:
+                    svc.bad_frame(m.group(1).decode(errors="replace")
+                                  if m else None, "%s: %s" % (
+                                      type(e).__name__, e))
+                return None
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        is_frame = isinstance(req, dict) and req.get("cmd") == "frame"
+        try:
+            if not isinstance(req, dict):
+                raise ValueError("request is not a JSON object")
+            with svc.lock:
+                rep = svc.handle(req)
+        except Exception as e:       # report, keep serving
+            if is_frame:
+                with svc.lock:
+                    svc.bad_frame(req.get("name"), "%s: %s" % (
+                        type(e).__name__, e))
+                return None
+            rep = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        return None if is_frame else rep
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -892,6 +1221,10 @@ def build_parser():
     ap.add_argument("--listen", default="0.0.0.0:7131")
     ap.add_argument("--data", default="/var/lib/k1-lidar")
     ap.add_argument("--allow", action="append", default=[])
+    ap.add_argument("--profile", choices=("helper", "printer"),
+                    default="helper",
+                    help="printer: running on the printer itself (6 scans,"
+                    " no raw files, data folder <= 200 MB)")
     return ap
 
 
@@ -904,10 +1237,10 @@ def main():
         addr = (host, int(port))
     lhost, lport = a.listen.rsplit(":", 1)
     srv = Server((lhost, int(lport)), Handler)
-    srv.svc = Service(Middleware(addr), a.data)
+    srv.svc = Service(Middleware(addr), a.data, a.profile)
     srv.allow = set(a.allow)
-    print("k1-lidar service on %s, LiDAR via %s, data in %s" % (
-        a.listen, a.socket or a.printer, a.data), flush=True)
+    print("k1-lidar service on %s, LiDAR via %s, data in %s, profile %s"
+          % (a.listen, a.socket or a.printer, a.data, a.profile), flush=True)
     srv.serve_forever()
 
 
