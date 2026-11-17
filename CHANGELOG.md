@@ -15,7 +15,7 @@ between minor versions).
   it rests ~20 ms, so Klipper keeps CPU room. Measured on a K1 Max before:
   38 s at 50-55 % CPU for the level 4/5 fit, 24 s for the first-layer
   check, total CPU idle down to 4-9 %. Results unchanged; the Pi/PC helper
-  is not paced.
+  is not paced. Measured on the K1 Max, level 4 mesh with the helper on the printer: time above 45 % CPU 18 s -> 4 s, above 30 % 38 s -> 26 s, lowest total CPU idle 5 % -> 8 %, 12 s longer (331 -> 343 s); Klipper logged no timer errors either way. Some short peaks remain (work between the paced loops).
 
 ## [0.5.0] - 2026-11-17
 
