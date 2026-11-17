@@ -66,7 +66,9 @@ Without a second computer the K1 can run `lidar_service.py` itself
 (since 0.5.0). Bed meshes, the first-layer check, dwell scans, the
 LiDAR-only PA test, the LiDAR offset cross, skew and benchmarks work; the
 analysis is ~3x slower (lidar.py waits up to 3x longer, at most 300 s), and
-the service runs niced so Klipper keeps its CPU. The K1 has no numpy, so
+the service runs niced so Klipper keeps its CPU. Since 0.5.1 it also
+paces the heavy analysis (fine mesh levels 4/5, first-layer check): after
+~20 ms of work it rests ~20 ms. The K1 has no numpy, so
 everything that analyses photos or flow bands is refused before anything is
 printed: `LIDAR_PA_CALIBRATE` falls back to the LiDAR-only PA test,
 `LIDAR_OFFSET_CALIBRATE` to the LiDAR cross, and `LIDAR_PA_FLOW_CALIBRATE` /

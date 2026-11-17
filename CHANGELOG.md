@@ -7,6 +7,16 @@ between minor versions).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-17
+
+### Changed
+- The helper running on the printer itself (local mode) paces its heavy
+  analysis (fine mesh levels 4/5, first-layer check): after ~20 ms of work
+  it rests ~20 ms, so Klipper keeps CPU room. Measured on a K1 Max before:
+  38 s at 50-55 % CPU for the level 4/5 fit, 24 s for the first-layer
+  check, total CPU idle down to 4-9 %. Results unchanged; the Pi/PC helper
+  is not paced.
+
 ## [0.5.0] - 2026-11-17
 
 Brings FreeTheBeam up to the development K1 Max's state of 2026-11-17: flow
@@ -393,7 +403,8 @@ First public release.
 - Helper service for a second computer, K1 Max boot script, protocol, pinout
   and install docs, offline tests with a fake module.
 
-[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/PainfulDirt/FreeTheBeam/compare/v0.3.1...v0.3.2

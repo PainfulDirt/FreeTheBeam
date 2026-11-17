@@ -20,7 +20,7 @@ import termios
 import time
 
 # FreeTheBeam release (also in klipper/lidar.py and CHANGELOG.md)
-__version__ = '0.5.0'
+__version__ = '0.5.1'
 
 PORT = '/dev/serial/by-id/creality-laser'
 BAUD = termios.B1500000
